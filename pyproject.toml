@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opteryx-sqlalchemy"
-version = "0.0.0"
+version = "0.0.1"
 description = "Opteryx SQLAlchemy Dialect"
 requires-python = ">=3.11"
 dependencies = [
-    "brotli-asgi",
+    "brotli-asgi==1.5.0",
     "python-jose[cryptography]==3.3.0",
     "cryptography>=40.0.0",
     "requests>=2.30.0",
