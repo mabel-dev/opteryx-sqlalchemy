@@ -8,7 +8,7 @@ version = "0.0.1"
 description = "Opteryx SQLAlchemy Dialect"
 requires-python = ">=3.11"
 dependencies = [
-    "brotli-asgi==1.5.0",
+    "brotli-asgi==1.6.0",
     "python-jose[cryptography]==3.3.0",
     "cryptography>=46.0.3",
     "requests>=2.32.5",
