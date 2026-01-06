@@ -77,8 +77,8 @@ class TestConnection:
 
     def test_connection_init_with_ssl(self):
         """Test connection initialization with SSL."""
-        conn = dbapi.Connection(host="data.opteryx.app", port=443, ssl=True)
-        assert conn._base_url == "https://data.opteryx.app"
+        conn = dbapi.Connection(host="jobs.opteryx.app", port=443, ssl=True)
+        assert conn._base_url == "https://jobs.opteryx.app"
         conn.close()
 
     def test_connection_init_with_token(self):
@@ -312,7 +312,7 @@ class TestCursor:
         mock_get.return_value = get_response
 
         conn = dbapi.Connection(
-            username="username", token="password", host="data.opteryx.app", port=443, ssl=True
+            username="username", token="password", host="jobs.opteryx.app", port=443, ssl=True
         )
         cursor = conn.cursor()
         # Trigger a statement submission so a second POST call is made
@@ -322,12 +322,12 @@ class TestCursor:
         assert getattr(cursor, "_jwt_token") == "jwt-123"
         assert conn._session.headers.get("Authorization") == "Bearer jwt-123"
 
-        # Ensure that the auth POST went to the auth subdomain and the statement was posted to the data subdomain
+        # Ensure that the auth POST went to the authenticate subdomain and the statement was posted to the jobs subdomain
         assert mock_post.call_count >= 2
         first_call_url = mock_post.call_args_list[0][0][0]
         second_call_url = mock_post.call_args_list[1][0][0]
-        assert first_call_url.endswith("auth.opteryx.app/token")
-        assert second_call_url.endswith("data.opteryx.app/api/v1/statements")
+        assert first_call_url.endswith("authenticate.opteryx.app/token")
+        assert second_call_url.endswith("jobs.opteryx.app/api/v1/jobs")
         conn.close()
 
     @patch("requests.Session.post")
@@ -371,6 +371,35 @@ class TestCursor:
             cursor.execute("SELECT * FROM invalid")
         conn.close()
 
+    @patch("requests.Session.post")
+    @patch("requests.Session.get")
+    def test_execute_no_data_response(self, mock_get, mock_post):
+        """If the server returns success but no columns/data, the cursor should still be usable and return empty rows."""
+        post_response = MagicMock()
+        post_response.status_code = 201
+        post_response.json.return_value = {"execution_id": "handle-empty"}
+        mock_post.return_value = post_response
+
+        # Status indicates completion but no data payload
+        get_response = MagicMock()
+        get_response.status_code = 200
+        get_response.json.return_value = {
+            "execution_id": "handle-empty",
+            "status": {"state": "SUCCEEDED"},
+            "total_rows": 0,
+            "data": [],
+        }
+        mock_get.return_value = get_response
+
+        conn = dbapi.Connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1")
+        assert cursor._statement_handle == "handle-empty"
+        # description should have been set to an empty list to avoid SQLAlchemy closing the result
+        assert cursor.description == []
+        assert cursor.fetchall() == []
+        conn.close()
+
 
 class TestDialect:
     """Tests for the SQLAlchemy dialect."""
@@ -404,11 +433,11 @@ class TestDialect:
         from sqlalchemy.engine.url import make_url
 
         dialect = OptetyxDialect()
-        url = make_url("opteryx://user:token123@data.opteryx.app:443/mydb?ssl=true&timeout=60")
+        url = make_url("opteryx://user:token123@opteryx.app:443/mydb?ssl=true&timeout=60")
         args, kwargs = dialect.create_connect_args(url)
 
         assert args == []
-        assert kwargs["host"] == "data.opteryx.app"
+        assert kwargs["host"] == "jobs.opteryx.app"
         assert kwargs["port"] == 443
         assert kwargs["username"] == "user"
         assert kwargs["token"] == "token123"

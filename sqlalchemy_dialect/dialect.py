@@ -8,8 +8,8 @@ Connection URL format:
     opteryx://[username:token@]host[:port]/[database][?ssl=true]
 
 Examples:
-    opteryx://data.opteryx.app/default
-    opteryx://user:mytoken@data.opteryx.app:443/default?ssl=true
+    opteryx://jobs.opteryx.app/default
+    opteryx://user:mytoken@jobs.opteryx.app:443/default?ssl=true
     opteryx://localhost:8000/default
 """
 
@@ -107,6 +107,7 @@ class OptetyxDialect(default.DefaultDialect):
         "TIMESTAMP": sqltypes.DateTime,
         "DATETIME": sqltypes.DateTime,
         "BLOB": sqltypes.LargeBinary,
+        "VARBINARY": sqltypes.LargeBinary,
         "BINARY": sqltypes.LargeBinary,
     }
 
@@ -339,8 +340,23 @@ class OptetyxDialect(default.DefaultDialect):
 
 # Register the dialect
 def register_dialect() -> None:
-    """Register the Opteryx dialect with SQLAlchemy."""
+    """Register the Opteryx dialect with SQLAlchemy.
+
+    This function is a convenience for development/editable installs where
+    the package's entry points may not be present. Calling it (or importing
+    this module, which calls it automatically) ensures SQLAlchemy can find
+    the dialect when `create_engine("opteryx://...")` is used.
+    """
     from sqlalchemy.dialects import registry
 
-    registry.register("opteryx", "app.sqlalchemy_dialect.dialect", "OptetyxDialect")
-    registry.register("opteryx.http", "app.sqlalchemy_dialect.dialect", "OptetyxDialect")
+    # Register using the correct module path for the installed package
+    registry.register("opteryx", "sqlalchemy_dialect.dialect", "OptetyxDialect")
+    registry.register("opteryx.http", "sqlalchemy_dialect.dialect", "OptetyxDialect")
+
+
+# Ensure the dialect is registered on import so it works in editable/test mode
+try:
+    register_dialect()
+except Exception:
+    # Best-effort registration; failures here shouldn't break imports
+    pass

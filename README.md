@@ -2,7 +2,7 @@
 
 SQLAlchemy dialect for Opteryx Cloud (https://opteryx.app) — use On Demand Opteryx wherever SQLAlchemy is supported.
 
-This project packages a SQLAlchemy dialect and lightweight DBAPI 2.0 adapter that talk to Opteryx's HTTP API, enabling read-only SQL access to Opteryx Cloud from SQLAlchemy Core, engines, and downstream tools like pandas and dbt. The library is now published on PyPI as `opteryx-sqlalchemy`, so you can `pip install opteryx-sqlalchemy` in any environment.
+This project packages a SQLAlchemy dialect and lightweight DBAPI 2.0 adapter that talk to Opteryx's HTTP API, enabling read-only SQL access to Opteryx Cloud from SQLAlchemy Core, engines, and downstream tools like pandas and dbt. The library is published on PyPI as `opteryx-sqlalchemy`, so you can `pip install opteryx-sqlalchemy` in any environment.
 
 ---
 
@@ -25,11 +25,8 @@ Use the following SQLAlchemy URL format:
 opteryx://[username:token@]host[:port]/[database][?ssl=true&timeout=60]
 ```
 
-Examples:
-
-- `opteryx://opteryx.app/default`
+Example:
 - `opteryx://user:mytoken@opteryx.app:443/default?ssl=true`
-- `opteryx://localhost:8000/default`
 
 Notes:
 - If `ssl=true` or port 443 is used, the driver will use HTTPS. The default port is 8000 for plain HTTP, 443 for HTTPS.

@@ -7,7 +7,6 @@ Simple smoke-test script for Opteryx auth + data endpoints.
 from __future__ import annotations
 
 import os
-import pathlib
 import sys
 import time
 from typing import Any
@@ -21,7 +20,7 @@ from orso import DataFrame
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from sqlalchemy_opteryx.tests.__init__ import load_dotenv_simple
+from tests import load_dotenv_simple
 
 try:
     import brotli  # type: ignore[import]
@@ -29,14 +28,14 @@ except ImportError:  # pragma: no cover - optional dependency for brotli
     brotli = None
 
 
-load_dotenv_simple(str(pathlib.Path(__file__).resolve().parents[1] / ".env"))
+load_dotenv_simple("../.env")
 
 
-DEFAULT_AUTH_URL = "https://auth.opteryx.app"
-DEFAULT_DATA_URL = "https://data.opteryx.app"
+DEFAULT_AUTH_URL = "https://authenticate.opteryx.app"
+DEFAULT_DATA_URL = "https://jobs.opteryx.app"
 DEFAULT_CLIENT_ID = os.environ.get("CLIENT_ID")
 DEFAULT_CLIENT_SECRET = os.environ.get("CLIENT_SECRET")
-SQL_STATEMENT = "SELECT S.Company FROM $missions AS S CROSS JOIN $planets AS P"
+SQL_STATEMENT = "SELECT * FROM $planets AS P"
 
 
 def fatal(msg: str) -> None:
@@ -91,9 +90,12 @@ def get_token(
 def create_statement(
     data_url: str, token: str, sql: str = "SELECT 1", describe_only: bool | None = None
 ) -> Dict[str, Any]:
-    url = f"{data_url.rstrip('/')}/api/v1/statements"
+    url = f"{data_url.rstrip('/')}/api/v1/jobs"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload: Dict[str, Any] = {"sqlText": sql}
+    payload: Dict[str, Any] = {
+        "sql_text": sql,
+        "client_info": {"application_name": "smoke_test_script"},
+    }
     if describe_only is not None:
         payload["describeOnly"] = describe_only
 
@@ -103,7 +105,7 @@ def create_statement(
 
 
 def get_statement_status(data_url: str, token: str, handle: str) -> Dict[str, Any]:
-    url = f"{data_url.rstrip('/')}/api/v1/statements/{handle}/status"
+    url = f"{data_url.rstrip('/')}/api/v1/jobs/{handle}/status"
     headers = {"Authorization": f"Bearer {token}"}
     r = requests.get(url, headers=headers, timeout=10)
     r.raise_for_status()
@@ -113,7 +115,7 @@ def get_statement_status(data_url: str, token: str, handle: str) -> Dict[str, An
 def get_statement_data(
     data_url: str, token: str, handle: str, offset: Optional[int] = None
 ) -> Dict[str, Any]:
-    url = f"{data_url.rstrip('/')}/api/v1/statements/{handle}/results"
+    url = f"{data_url.rstrip('/')}/api/v1/jobs/{handle}/results"
     if offset is not None:
         url += f"?offset={offset}"
     headers = {"Authorization": f"Bearer {token}"}
@@ -135,7 +137,7 @@ def get_statement_data(
 
 
 def statement_results_to_dataframe(columns: Optional[Sequence[Dict[str, Any]]]) -> DataFrame:
-    """Build an Orso DataFrame from the data.opteryx.app column payload."""
+    """Build an Orso DataFrame from the jobs.opteryx.app column payload."""
 
     if not columns:
         return DataFrame(rows=[], schema=[])

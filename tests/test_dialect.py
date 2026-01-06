@@ -44,7 +44,7 @@ def test_streaming_query():
 
     with engine.connect() as conn:
         result = conn.execution_options(stream_results=True, max_row_buffer=500).execute(
-            text("SELECT S.id, P.id FROM $satellites AS S CROSS JOIN $planets AS P")
+            text("SELECT id FROM $planets AS P")
         )
         count = 0
         for _ in result:
@@ -52,22 +52,20 @@ def test_streaming_query():
         print(f"Total rows fetched: {count}")
         assert count > 0
 
-        
+
 def test_load_into_pandas():
     import pandas as pd
-    
+
     engine = _get_engine_from_env()
     # read table data using sql query
-    sql_df = pd.read_sql(
-        "SELECT * FROM $planets",
-        con=engine
-    )
+    sql_df = pd.read_sql("SELECT * FROM $planets", con=engine)
     assert not sql_df.empty, "DataFrame is empty"
     assert "name" in sql_df.columns, "'name' column not found in DataFrame"
 
+
 if __name__ == "__main__":
-    #test_opteryx_connection()
+    # test_opteryx_connection()
     test_streaming_query()
-    #test_load_into_pandas()
+    # test_load_into_pandas()
 
     # pytest.main([__file__])

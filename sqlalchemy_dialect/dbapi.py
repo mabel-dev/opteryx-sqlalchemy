@@ -1,4 +1,5 @@
-"""DBAPI 2.0 (PEP 249) compliant interface for Opteryx data service.
+"""
+DBAPI 2.0 (PEP 249) compliant interface for Opteryx (opteryx.app).
 
 This module implements a minimal DBAPI 2.0 interface that communicates
 with the Opteryx data service via HTTP. It provides Connection and Cursor
@@ -9,6 +10,7 @@ from __future__ import annotations
 
 import json
 import time
+from importlib.metadata import version
 from typing import Any
 from typing import Dict
 from typing import List
@@ -19,6 +21,11 @@ from typing import Union
 from urllib.parse import urljoin
 
 import requests
+
+try:
+    __version__ = version("opteryx-sqlalchemy")
+except Exception:
+    __version__ = "unknown"
 
 # Module globals required by PEP 249
 apilevel = "2.0"
@@ -110,6 +117,11 @@ class Cursor:
         self._closed = False
         self._statement_handle: Optional[str] = None
 
+        # Execution option placeholders (may be set by dialect.do_execute)
+        self._opteryx_execution_options: dict = {}
+        self._opteryx_stream_results_requested: bool = False
+        self._opteryx_max_row_buffer: Optional[int] = None
+
         # Try to authenticate using client credentials (client credentials flow)
         # client_id is connection._username and client_secret is connection._token
         try:
@@ -124,7 +136,7 @@ class Cursor:
                     domain = host
                 # Only add auth. prefix when domain looks like a DNS name (not 'localhost')
                 if "." in domain and not domain.startswith("localhost"):
-                    auth_host = f"auth.{domain}"
+                    auth_host = f"authenticate.{domain}"
                 else:
                     auth_host = domain
                 scheme = "https" if getattr(self._connection, "_ssl", False) else "http"
@@ -240,6 +252,12 @@ class Cursor:
         # Poll for completion
         self._poll_for_results()
 
+        # Ensure description is not None so SQLAlchemy treats this as a rows-capable result.
+        # Some Opteryx responses may delay column metadata; setting an empty description here
+        # prevents SQLAlchemy from closing the result object immediately.
+        if self._description is None:
+            self._description = []
+
         return self
 
     def _poll_for_results(self) -> None:
@@ -341,6 +359,7 @@ class Cursor:
             data = result.get("data", [])
             if data:
                 if isinstance(data[0], dict) and "values" in data[0]:
+                    # Columnar format: each dict has {name: ..., values: [...]}
                     if not has_description:
                         self._description = [
                             (col.get("name", f"col{i}"), None, None, None, None, None, None)
@@ -350,7 +369,23 @@ class Cursor:
                     column_rows = self._rows_from_columnar_data(data)
                     rows.extend(column_rows)
                     new_rows = len(column_rows)
+                elif isinstance(data[0], dict):
+                    # Row format: each dict is a row with {col1: val1, col2: val2, ...}
+                    if not has_description and data:
+                        # Extract column names from first row
+                        col_names = list(data[0].keys())
+                        self._description = [
+                            (col_name, None, None, None, None, None, None) for col_name in col_names
+                        ]
+                        has_description = True
+                    # Convert each row dict to a tuple in the correct column order
+                    col_order = [col[0] for col in (self._description or [])]
+                    for row_dict in data:
+                        row_tuple = tuple(row_dict.get(col) for col in col_order)
+                        rows.append(row_tuple)
+                    new_rows = len(data)
                 else:
+                    # List/tuple format
                     for row in data:
                         rows.append(tuple(row))
                     new_rows = len(data)
@@ -448,7 +483,7 @@ class Connection:
 
     def __init__(
         self,
-        host: str = "localhost",
+        host: str = "jobs.opteryx.app",
         port: int = 8000,
         username: Optional[str] = None,
         token: Optional[str] = None,
@@ -493,13 +528,13 @@ class Connection:
         """Return the base domain for the given host by stripping known subdomain prefixes.
 
         Examples:
-            'data.opteryx.app' -> 'opteryx.app'
-            'auth.opteryx.app' -> 'opteryx.app'
+            'jobs.opteryx.app' -> 'opteryx.app'
+            'authenticate.opteryx.app' -> 'opteryx.app'
             'opteryx.app' -> 'opteryx.app'
             'localhost' -> 'localhost'
         """
         domain = host
-        for p in ("data.", "auth."):
+        for p in ("jobs.", "authenticate."):
             if domain.startswith(p):
                 domain = domain[len(p) :]
         return domain
@@ -510,7 +545,7 @@ class Connection:
         domain = self._normalize_domain(self._host)
         # Only add subdomain prefix for DNS-style hosts (e.g. example.com), not for localhost or IPs
         if "." in domain and not domain.startswith("localhost"):
-            data_host = f"data.{domain}"
+            data_host = f"jobs.{domain}"
         else:
             data_host = domain
         if (self._ssl and self._port == 443) or (not self._ssl and self._port == 80):
@@ -528,8 +563,14 @@ class Connection:
         """Submit a SQL statement to the data service."""
         self._check_closed()
 
-        url = urljoin(self._data_base_url() + "/", "api/v1/statements")
-        payload: Dict[str, Any] = {"sqlText": sql}
+        url = urljoin(self._data_base_url() + "/", "api/v1/jobs")
+        payload: Dict[str, Any] = {
+            "sql_text": sql,
+            "client_info": {
+                "application_name": "opteryx-sqlalchemy",
+                "application_version": __version__,
+            },
+        }
         if parameters:
             payload["parameters"] = parameters
 
@@ -552,7 +593,7 @@ class Connection:
         """Get the status of a submitted statement."""
         self._check_closed()
 
-        url = urljoin(self._data_base_url() + "/", f"api/v1/statements/{statement_handle}/status")
+        url = urljoin(self._data_base_url() + "/", f"api/v1/jobs/{statement_handle}/status")
 
         try:
             response = self._session.get(url, timeout=self._timeout)
@@ -568,25 +609,48 @@ class Connection:
     def _get_statement_results(
         self, statement_handle: str, num_rows: Optional[int] = None, offset: Optional[int] = None
     ) -> Dict[str, Any]:
-        """Get results for a completed statement.
+        """Get results for a completed statement using the /download endpoint.
 
-        Note: The current API may return results as part of status response
-        or via a separate results endpoint. This method handles both cases.
+        Args:
+            statement_handle: The execution ID returned by submit
+            num_rows: Maximum number of rows to return (maps to 'limit' param)
+            offset: Row offset for pagination
+
+        Returns:
+            Dictionary containing the result data in a format compatible with process_result_page.
+            The download endpoint returns NDJSON (newline-delimited JSON), so we parse it and
+            convert to the expected format.
         """
-        url = urljoin(self._data_base_url() + "/", f"api/v1/statements/{statement_handle}/results")
-        params: Dict[str, Any] = {}
+        url = urljoin(self._data_base_url() + "/", f"api/v1/jobs/{statement_handle}/download")
+        params: Dict[str, Any] = {"file_format": "json"}
         if num_rows is not None:
-            params["num_rows"] = int(num_rows)
+            params["limit"] = int(num_rows)
         if offset is not None:
             params["offset"] = int(offset)
         try:
-            response = self._session.get(url, params=params or None, timeout=self._timeout)
+            response = self._session.get(url, params=params, timeout=self._timeout)
             response.raise_for_status()
-            return response.json()
+
+            # The download endpoint returns NDJSON (newline-delimited JSON)
+            # Parse each line as a separate JSON object (row)
+            rows = []
+            columns = None
+            for line in response.text.strip().split("\n"):
+                if line:
+                    row_dict = json.loads(line)
+                    if columns is None:
+                        # Extract column names from first row
+                        columns = list(row_dict.keys())
+                    rows.append(row_dict)
+
+            # Convert to the format expected by process_result_page
+            result = {"data": rows, "columns": [{"name": col} for col in (columns or [])]}
+
+            return result
         except requests.exceptions.RequestException:
             pass
 
-        # Fallback to status endpoint if dedicated results are unavailable
+        # Fallback to status endpoint if dedicated download endpoint is unavailable
         return self._get_statement_status(statement_handle)
 
     def close(self) -> None:
