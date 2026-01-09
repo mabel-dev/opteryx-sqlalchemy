@@ -15,6 +15,7 @@ Examples:
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
 from typing import Optional
@@ -26,6 +27,8 @@ from sqlalchemy.engine.interfaces import ExecutionContext
 from sqlalchemy.engine.url import URL
 
 from . import dbapi
+
+logger = logging.getLogger("sqlalchemy.dialects.opteryx")
 
 
 def _quote_identifier(identifier: str) -> str:
@@ -201,8 +204,10 @@ class OptetyxDialect(default.DefaultDialect):
             cursor.execute("SELECT 1")
             cursor.fetchone()
             cursor.close()
+            logger.debug("Connection ping successful")
             return True
-        except Exception:
+        except Exception as e:
+            logger.warning("Connection ping failed: %s", e)
             return False
 
     def get_isolation_level(self, dbapi_connection: Any) -> str:
@@ -234,11 +239,14 @@ class OptetyxDialect(default.DefaultDialect):
                 full_name = f"{quoted_schema}.{quoted_table}"
             else:
                 full_name = quoted_table
+            logger.debug("Checking if table exists: %s", full_name)
             result = connection.execute(f"SELECT * FROM {full_name} LIMIT 0")
             result.close()
+            logger.debug("Table exists: %s", full_name)
             return True
-        except (ValueError, Exception):
+        except (ValueError, Exception) as e:
             # ValueError from invalid identifier, or database error
+            logger.debug("Table does not exist or error checking: %s - %s", table_name, e)
             return False
 
     def get_columns(
