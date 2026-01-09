@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opteryx-sqlalchemy"
-version = "0.0.3"
+version = "0.0.4"
 description = "Opteryx SQLAlchemy Dialect"
 requires-python = ">=3.9"
 dependencies = [
