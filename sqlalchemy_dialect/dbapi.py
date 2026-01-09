@@ -9,6 +9,7 @@ classes that translate SQL queries into HTTP requests.
 from __future__ import annotations
 
 import json
+import logging
 import time
 from importlib.metadata import version
 from typing import Any
@@ -21,6 +22,8 @@ from typing import Union
 from urllib.parse import urljoin
 
 import requests
+
+logger = logging.getLogger("sqlalchemy.dialects.opteryx")
 
 try:
     __version__ = version("opteryx-sqlalchemy")
@@ -128,11 +131,13 @@ class Cursor:
             username = getattr(self._connection, "_username", None)
             secret = getattr(self._connection, "_token", None)
             if username and secret:
+                logger.debug("Attempting client credentials authentication for user: %s", username)
                 host = getattr(self._connection, "_host", "localhost")
                 # Normalize domain and build auth host (auth.domain)
                 try:
                     domain = self._connection._normalize_domain(host)
-                except Exception:
+                except Exception as e:
+                    logger.debug("Failed to normalize domain '%s': %s", host, e)
                     domain = host
                 # Only add auth. prefix when domain looks like a DNS name (not 'localhost')
                 if "." in domain and not domain.startswith("localhost"):
@@ -141,6 +146,7 @@ class Cursor:
                     auth_host = domain
                 scheme = "https" if getattr(self._connection, "_ssl", False) else "http"
                 auth_url = f"{scheme}://{auth_host}/token"
+                logger.debug("Authentication URL: %s", auth_url)
 
                 # Build form-encoded payload
                 payload = {
@@ -165,17 +171,21 @@ class Cursor:
                 token = body.get("access_token") or body.get("token") or body.get("jwt")
                 if token:
                     self._jwt_token = token
+                    logger.info("Authentication successful for user: %s", username)
                     # Set Authorization header for subsequent requests via the connection session
                     try:
                         self._connection._session.headers["Authorization"] = f"Bearer {token}"
-                    except Exception:
-                        # If connection session is not available or some other issue, ignore gracefully
-                        pass
-        except requests.exceptions.RequestException:
+                    except Exception as e:
+                        logger.warning("Failed to set Authorization header: %s", e)
+                else:
+                    logger.warning("Authentication response missing token for user: %s", username)
+        except requests.exceptions.RequestException as e:
             # Authentication failed — don't raise here; we will attempt queries without the JWT
+            logger.warning("Authentication failed for user %s: %s", username, e)
             self._jwt_token = None
-        except Exception:
+        except Exception as e:
             # Any unexpected failure in auth should not crash cursor creation
+            logger.error("Unexpected error during authentication: %s", e, exc_info=True)
             self._jwt_token = None
 
     @property
@@ -230,6 +240,12 @@ class Cursor:
         self._description = None
         self._rowcount = -1
 
+        # Log query (truncate if too long)
+        query_preview = operation[:200] + "..." if len(operation) > 200 else operation
+        logger.debug("Executing query: %s", query_preview)
+        if parameters:
+            logger.debug("Query parameters: %s", parameters)
+
         # Convert sequence parameters to dict if needed
         params_dict: Optional[Dict[str, Any]] = None
         if parameters is not None:
@@ -243,14 +259,21 @@ class Cursor:
                     operation = operation.replace("?", f":p{i}", 1)
 
         # Submit the statement
+        start_time = time.time()
         response = self._connection._submit_statement(operation, params_dict)
         self._statement_handle = response.get("execution_id")
 
         if not self._statement_handle:
+            logger.error("No execution ID in response: %s", response)
             raise DatabaseError("No statement handle returned from server")
+
+        logger.debug("Statement submitted with execution_id: %s", self._statement_handle)
 
         # Poll for completion
         self._poll_for_results()
+
+        elapsed = time.time() - start_time
+        logger.info("Query completed in %.2fs, returned %d rows", elapsed, self._rowcount)
 
         # Ensure description is not None so SQLAlchemy treats this as a rows-capable result.
         # Some Opteryx responses may delay column metadata; setting an empty description here
@@ -266,8 +289,12 @@ class Cursor:
             return
 
         max_wait = 300  # Maximum wait time in seconds
-        poll_interval = 0.5
+        poll_interval = 0.5  # Initial poll interval in seconds
         elapsed = 0.0
+        last_log_time = 0.0  # Track when we last logged progress
+        log_interval = 5.0  # Log progress every 5 seconds
+
+        logger.debug("Polling for execution_id: %s", self._statement_handle)
 
         while elapsed < max_wait:
             status = self._connection._get_statement_status(self._statement_handle)
@@ -285,25 +312,38 @@ class Cursor:
 
             normalized_state = (state_value or "UNKNOWN").upper()
 
+            # Log progress periodically for long-running queries
+            if elapsed - last_log_time >= log_interval:
+                logger.info(
+                    "Query still executing (state=%s, elapsed=%.1fs)", normalized_state, elapsed
+                )
+                last_log_time = elapsed
+
             if normalized_state in ("COMPLETED", "SUCCEEDED", "INCHOATE"):
+                logger.debug("Query execution completed with state: %s", normalized_state)
                 self._fetch_results()
                 return
             if normalized_state in ("FAILED", "CANCELLED"):
-                description = (
-                    status_details.get("description")
+                error_message = (
+                    status.get("error_message")
+                    or status_details.get("description")
                     or status.get("description")
                     or status.get("detail")
                     or "Unknown error"
                 )
-                raise DatabaseError(f"Statement execution failed: {description}")
+                logger.error("Query failed with state %s: %s", normalized_state, error_message)
+                raise ProgrammingError(error_message)
             if normalized_state in ("UNKNOWN", "SUBMITTED", "EXECUTING", "RUNNING"):
+                logger.debug("Query state: %s (elapsed: %.1fs)", normalized_state, elapsed)
                 time.sleep(poll_interval)
                 elapsed += poll_interval
                 poll_interval = min(poll_interval * 1.5, 2.5)
                 continue
 
+            logger.error("Unexpected statement state: %s", state_value)
             raise DatabaseError(f"Unknown statement state: {state_value}")
 
+        logger.error("Query execution timed out after %.1fs", elapsed)
         raise OperationalError("Statement execution timed out")
 
     @staticmethod
@@ -518,10 +558,15 @@ class Connection:
         else:
             self._base_url = f"{scheme}://{host}:{port}"
 
+        logger.debug(
+            "Creating connection to %s (ssl=%s, timeout=%.1fs)", self._base_url, ssl, timeout
+        )
+
         # Create session for connection pooling
         self._session = requests.Session()
         if token:
             self._session.headers["Authorization"] = f"Bearer {token}"
+            logger.debug("Using pre-configured token for authentication")
         self._session.headers["Content-Type"] = "application/json"
 
     def _normalize_domain(self, host: str) -> str:
@@ -574,26 +619,37 @@ class Connection:
         if parameters:
             payload["parameters"] = parameters
 
+        logger.debug("Submitting statement to %s", url)
+
         try:
             response = self._session.post(url, json=payload, timeout=self._timeout)
             response.raise_for_status()
-            return response.json()
+            result = response.json()
+            logger.debug(
+                "Statement submitted successfully, execution_id: %s", result.get("execution_id")
+            )
+            return result
         except requests.exceptions.HTTPError as e:
             if e.response is not None:
+                status_code = e.response.status_code
                 # Authentication/authorization errors should raise OperationalError
-                if e.response.status_code in (401, 403):
+                if status_code in (401, 403):
                     try:
                         detail = e.response.json().get("detail", str(e))
                     except (ValueError, json.JSONDecodeError):
                         detail = e.response.text or str(e)
+                    logger.error("Authentication error (HTTP %d): %s", status_code, detail)
                     raise OperationalError(f"Authentication error: {detail}") from e
                 try:
                     detail = e.response.json().get("detail", str(e))
                 except (ValueError, json.JSONDecodeError):
                     detail = e.response.text or str(e)
+                logger.error("HTTP error %d submitting statement: %s", status_code, detail)
                 raise DatabaseError(f"HTTP error: {detail}") from e
+            logger.error("HTTP error submitting statement: %s", e)
             raise DatabaseError(f"HTTP error: {e}") from e
         except requests.exceptions.RequestException as e:
+            logger.error("Connection error submitting statement: %s", e)
             raise OperationalError(f"Connection error: {e}") from e
 
     def _get_statement_status(self, statement_handle: str) -> Dict[str, Any]:
@@ -602,28 +658,40 @@ class Connection:
 
         url = urljoin(self._data_base_url() + "/", f"api/v1/jobs/{statement_handle}/status")
 
+        logger.debug("Checking status for execution_id: %s", statement_handle)
+
         try:
             response = self._session.get(url, timeout=self._timeout)
             response.raise_for_status()
-            return response.json()
+            result = response.json()
+            logger.debug("Status check response: %s", result.get("status") or result.get("state"))
+            return result
         except requests.exceptions.HTTPError as e:
             if e.response is not None:
+                status_code = e.response.status_code
                 # Authentication/authorization errors should raise OperationalError
-                if e.response.status_code in (401, 403):
+                if status_code in (401, 403):
                     try:
                         detail = e.response.json().get("detail", str(e))
                     except (ValueError, json.JSONDecodeError):
                         detail = e.response.text or str(e)
+                    logger.error(
+                        "Authentication error (HTTP %d) checking status: %s", status_code, detail
+                    )
                     raise OperationalError(f"Authentication error: {detail}") from e
-                if e.response.status_code == 404:
+                if status_code == 404:
+                    logger.error("Statement not found: %s", statement_handle)
                     raise ProgrammingError("Statement not found") from e
                 try:
                     detail = e.response.json().get("detail", str(e))
                 except (ValueError, json.JSONDecodeError):
                     detail = e.response.text or str(e)
+                logger.error("HTTP error %d checking status: %s", status_code, detail)
                 raise DatabaseError(f"HTTP error: {detail}") from e
+            logger.error("HTTP error checking status: %s", e)
             raise DatabaseError(f"HTTP error: {e}") from e
         except requests.exceptions.RequestException as e:
+            logger.error("Connection error checking status: %s", e)
             raise OperationalError(f"Connection error: {e}") from e
 
     def _get_statement_results(
@@ -647,6 +715,14 @@ class Connection:
             params["limit"] = int(num_rows)
         if offset is not None:
             params["offset"] = int(offset)
+
+        logger.debug(
+            "Fetching results for execution_id: %s (limit=%s, offset=%s)",
+            statement_handle,
+            num_rows,
+            offset,
+        )
+
         try:
             response = self._session.get(url, params=params, timeout=self._timeout)
             response.raise_for_status()
@@ -666,6 +742,7 @@ class Connection:
             # Convert to the format expected by process_result_page
             result = {"data": rows, "columns": [{"name": col} for col in (columns or [])]}
 
+            logger.debug("Fetched %d rows from download endpoint", len(rows))
             return result
         except requests.exceptions.HTTPError as e:
             if e.response is not None:
@@ -675,10 +752,12 @@ class Connection:
                         detail = e.response.json().get("detail", str(e))
                     except (ValueError, json.JSONDecodeError):
                         detail = e.response.text or str(e)
+                    logger.error("Authentication error fetching results: %s", detail)
                     raise OperationalError(f"Authentication error: {detail}") from e
             # For other HTTP errors, fall back to status endpoint
-        except requests.exceptions.RequestException:
-            pass
+            logger.debug("Download endpoint unavailable, falling back to status endpoint")
+        except requests.exceptions.RequestException as e:
+            logger.debug("Error fetching from download endpoint: %s, falling back", e)
 
         # Fallback to status endpoint if dedicated download endpoint is unavailable
         return self._get_statement_status(statement_handle)
@@ -686,6 +765,7 @@ class Connection:
     def close(self) -> None:
         """Close the connection."""
         if not self._closed:
+            logger.debug("Closing connection to %s", self._base_url)
             self._session.close()
             self._closed = True
 

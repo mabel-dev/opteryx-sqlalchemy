@@ -13,6 +13,7 @@ This project packages a SQLAlchemy dialect and lightweight DBAPI 2.0 adapter tha
 - Lightweight DBAPI implementation that maps Opteryx types to SQLAlchemy while surfacing DatabaseError/OperationalError semantics.
 - Compatible with SQLAlchemy 2.x usage patterns, including context-managed engines and `text` queries.
 - Work with pandas, dbt, or other tooling that understands SQLAlchemy engines.
+- **Comprehensive debug logging** for troubleshooting connection, authentication, and query execution issues.
 - Install from PyPI (`pip install opteryx-sqlalchemy`) or lock into editable mode for development.
 
 ---
@@ -25,8 +26,10 @@ Use the following SQLAlchemy URL format:
 opteryx://[username:token@]host[:port]/[database][?ssl=true&timeout=60]
 ```
 
-Example:
-- `opteryx://user:mytoken@opteryx.app:443/default?ssl=true`
+Examples:
+- **Opteryx Cloud (with token)**: `opteryx://myusername:mytoken@opteryx.app:443/default?ssl=true`
+- **Local Opteryx (no auth)**: `opteryx://localhost:8000/default`
+- **Self-hosted (with auth)**: `opteryx://user:token@opteryx.example.com/my_database?ssl=true`
 
 Notes:
 - If `ssl=true` or port 443 is used, the driver will use HTTPS. The default port is 8000 for plain HTTP, 443 for HTTPS.
@@ -34,7 +37,15 @@ Notes:
 
 ---
 
-## Installation
+## Getting Started
+
+### 1. Create an Opteryx Account
+
+If you don't have an Opteryx account yet, register at: **https://opteryx.app/auth/register.html**
+
+Once registered, you'll receive credentials (username and token) needed to authenticate.
+
+### 2. Install the Package
 
 Install the published package from PyPI in any environment:
 
@@ -59,11 +70,14 @@ Basic usage with SQLAlchemy 2.x:
 ```python
 from sqlalchemy import create_engine, text
 
-# Basic connection (no token)
-engine = create_engine("opteryx://opteryx.app/default?ssl=true")
+# Connect to Opteryx Cloud with your credentials
+engine = create_engine(
+    "opteryx://myusername:mytoken@opteryx.app:443/default?ssl=true"
+)
 
 with engine.connect() as conn:
-    result = conn.execute(text("SELECT id, name FROM users LIMIT 10"))
+    # Run a simple query
+    result = conn.execute(text("SELECT * FROM public.examples.users LIMIT 10"))
     for row in result:
         print(row)
 
@@ -73,11 +87,33 @@ with engine.connect() as conn:
     print(result.fetchall())
 ```
 
-Token authentication example:
+**Connection String Format:**
+- Replace `myusername` with your Opteryx username
+- Replace `mytoken` with your Opteryx authentication token
+- For Opteryx Cloud, always use `opteryx.app:443` with `ssl=true`
+
+---
+
+## Debug Logging 🔍
+
+The dialect includes comprehensive logging to help troubleshoot issues. Enable it with Python's standard `logging` module:
 
 ```python
-engine = create_engine("opteryx://username:password@opteryx.app:443/opteryx?ssl=true")
+import logging
+
+# Enable INFO level for query timing and status
+logging.basicConfig()
+logging.getLogger("sqlalchemy.dialects.opteryx").setLevel(logging.INFO)
+
+# Or enable DEBUG level for detailed request/response information
+logging.getLogger("sqlalchemy.dialects.opteryx").setLevel(logging.DEBUG)
 ```
+
+**What you'll see:**
+- **INFO**: Authentication status, query completion times, row counts, long-running query progress
+- **DEBUG**: HTTP requests/responses, query text, parameters, state transitions, execution IDs
+- **WARNING**: Authentication failures, non-fatal issues
+- **ERROR**: Failures with full context including HTTP status codes
 
 ---
 
@@ -89,9 +125,11 @@ You can use `pandas.read_sql_query` with a SQLAlchemy connection:
 import pandas as pd
 from sqlalchemy import create_engine
 
-engine = create_engine("opteryx://opteryx.app/default?ssl=true")
+engine = create_engine(
+    "opteryx://myusername:mytoken@opteryx.app:443/default?ssl=true"
+)
 with engine.connect() as conn:
-    df = pd.read_sql_query("SELECT * FROM users LIMIT 100", conn)
+    df = pd.read_sql_query("SELECT * FROM public.examples.users LIMIT 100", conn)
     print(df.head())
 ```
 
