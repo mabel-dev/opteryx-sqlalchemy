@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import sys
 
@@ -11,9 +12,14 @@ import sqlalchemy_dialect  # noqa: F401
 
 from sqlalchemy import create_engine, text
 
+# Configure logging to see the new debug output
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+# Enable INFO level for opteryx dialect to see query execution times
+logging.getLogger("sqlalchemy.dialects.opteryx").setLevel(logging.INFO)
+
 # username:token@host:port/database?ssl=true
-engine = create_engine("opteryx://username:password@opteryx.app:443/default?ssl=true")
+engine = create_engine("opteryx://bastian:12Monkeys@opteryx.app:443/default?ssl=true")
 
 with engine.connect() as conn:
-    res = conn.execute(text("SELECT id, name FROM $planets LIMIT 5"))
+    res = conn.execute(text("SELECT * FROM benchmarks.tpch.lineitem LIMIT 50"))
     print(res.fetchall())
