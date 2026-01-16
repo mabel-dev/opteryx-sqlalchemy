@@ -6,6 +6,7 @@ Simple smoke-test script for Opteryx auth + data endpoints.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -14,7 +15,6 @@ from typing import Dict
 from typing import Optional
 from typing import Sequence
 
-import orjson
 import requests
 from orso import DataFrame
 
@@ -35,7 +35,7 @@ DEFAULT_AUTH_URL = "https://authenticate.opteryx.app"
 DEFAULT_DATA_URL = "https://jobs.opteryx.app"
 DEFAULT_CLIENT_ID = os.environ.get("CLIENT_ID")
 DEFAULT_CLIENT_SECRET = os.environ.get("CLIENT_SECRET")
-SQL_STATEMENT = "SELECT * FROM $planets AS P"
+SQL_STATEMENT = "SELECT * FROM public.examples.planets AS P"
 
 
 def fatal(msg: str) -> None:
@@ -79,11 +79,24 @@ def get_token(
 
     r = requests.post(url, data=data, timeout=10)
     if r.status_code != 200:
-        raise RuntimeError(f"token endpoint returned status {r.status_code}: {r.text}")
+        error_msg = f"token endpoint returned status {r.status_code}"
+        if r.status_code == 401:
+            print("\n⚠️  401 Unauthorized Response:")
+            print(f"Headers: {dict(r.headers)}")
+            print(f"Body: {r.text}")
+            try:
+                json_body = r.json()
+                print(f"Parsed JSON: {json.dumps(json_body, indent=2)}")
+            except ValueError:
+                pass
+        raise RuntimeError(f"{error_msg}: {r.text}")
     body = r.json()
     token = body.get("access_token")
     if not token:
         raise RuntimeError("token endpoint returned no access_token")
+    expires_in = body.get("expires_in")
+    if expires_in:
+        print(f"  Token expires in {expires_in} seconds")
     return token
 
 
@@ -100,6 +113,17 @@ def create_statement(
         payload["describeOnly"] = describe_only
 
     r = requests.post(url, json=payload, headers=headers, timeout=10)
+    if r.status_code == 401:
+        print("\n⚠️  401 Unauthorized Response on jobs endpoint:")
+        print(f"URL: {url}")
+        print(f"Headers sent: {headers}")
+        print(f"Response Headers: {dict(r.headers)}")
+        print(f"Body: {r.text}")
+        try:
+            json_body = r.json()
+            print(f"Parsed JSON: {json.dumps(json_body, indent=2)}")
+        except ValueError:
+            pass
     r.raise_for_status()
     return r.json()
 
@@ -108,6 +132,17 @@ def get_statement_status(data_url: str, token: str, handle: str) -> Dict[str, An
     url = f"{data_url.rstrip('/')}/api/v1/jobs/{handle}/status"
     headers = {"Authorization": f"Bearer {token}"}
     r = requests.get(url, headers=headers, timeout=10)
+    if r.status_code == 401:
+        print("\n⚠️  401 Unauthorized Response on status endpoint:")
+        print(f"URL: {url}")
+        print(f"Headers sent: {headers}")
+        print(f"Response Headers: {dict(r.headers)}")
+        print(f"Body: {r.text}")
+        try:
+            json_body = r.json()
+            print(f"Parsed JSON: {json.dumps(json_body, indent=2)}")
+        except ValueError:
+            pass
     r.raise_for_status()
     return r.json()
 
@@ -122,6 +157,17 @@ def get_statement_data(
     if brotli is not None:
         headers["Accept-Encoding"] = "br"
     r = requests.get(url, headers=headers, timeout=10)
+    if r.status_code == 401:
+        print("\n⚠️  401 Unauthorized Response on results endpoint:")
+        print(f"URL: {url}")
+        print(f"Headers sent: {headers}")
+        print(f"Response Headers: {dict(r.headers)}")
+        print(f"Body: {r.text}")
+        try:
+            json_body = r.json()
+            print(f"Parsed JSON: {json.dumps(json_body, indent=2)}")
+        except ValueError:
+            pass
     r.raise_for_status()
     encoding = r.headers.get("Content-Encoding", "")
     if encoding.lower() == "br":
@@ -132,7 +178,7 @@ def get_statement_data(
         except brotli.error:
             # Already decompressed or corrupt stream; fall back to raw bytes
             content = r.content
-        return orjson.loads(content)
+        return json.loads(content)
     return r.json()
 
 

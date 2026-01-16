@@ -171,10 +171,31 @@ class Cursor:
                 token = body.get("access_token") or body.get("token") or body.get("jwt")
                 if token:
                     self._jwt_token = token
-                    logger.info("Authentication successful for user: %s", username)
+                    token_type = body.get("token_type", "bearer")
+                    # Capitalize token_type properly: "bearer" -> "Bearer"
+                    if token_type:
+                        token_type = (
+                            token_type[0].upper() + token_type[1:].lower()
+                            if len(token_type) > 0
+                            else "Bearer"
+                        )
+                    else:
+                        token_type = "Bearer"
+                    expires_in = body.get("expires_in")
+                    refresh_token = body.get("refresh_token")
+                    logger.info(
+                        "Authentication successful for user: %s (token_type=%s, expires_in=%s)",
+                        username,
+                        token_type,
+                        expires_in,
+                    )
+                    if refresh_token:
+                        logger.debug("Refresh token received for user: %s", username)
                     # Set Authorization header for subsequent requests via the connection session
                     try:
-                        self._connection._session.headers["Authorization"] = f"Bearer {token}"
+                        auth_header = f"{token_type} {token}"
+                        self._connection._session.headers["Authorization"] = auth_header
+                        logger.debug("Set Authorization header to: %s ...", auth_header[:50])
                     except Exception as e:
                         logger.warning("Failed to set Authorization header: %s", e)
                 else:
