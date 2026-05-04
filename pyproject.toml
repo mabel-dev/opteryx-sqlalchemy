@@ -10,9 +10,9 @@ requires-python = ">=3.9"
 dependencies = [
     "brotli-asgi>=1.6.0",
     "python-jose[cryptography]>=3.3.0",
-    "cryptography>=46.0.7",
+    "cryptography>=47.0.0",
     "requests>=2.33.1",
-    "python-multipart>=0.0.26",
+    "python-multipart>=0.0.27",
     "sqlalchemy>=2.0.49",
 ]
 
