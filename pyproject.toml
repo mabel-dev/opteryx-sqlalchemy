@@ -12,7 +12,7 @@ dependencies = [
     "python-jose[cryptography]>=3.3.0",
     "cryptography>=48.0.0",
     "requests>=2.34.2",
-    "python-multipart>=0.0.30",
+    "python-multipart>=0.0.32",
     "sqlalchemy>=2.0.50",
 ]
 
