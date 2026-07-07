@@ -16,7 +16,7 @@ jobs:
       - name: install dependencies
         run: |
           python -m pip install -U pip pytest
-          pip install -e .[sqlalchemy]
+          pip install -e .
 
       - name: run regression tests
-        run: python -m pytest -q sqlalchemy_opteryx/tests
+        run: python -m pytest -q tests
