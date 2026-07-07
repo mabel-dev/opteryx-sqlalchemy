@@ -196,6 +196,7 @@ class Cursor:
                     try:
                         auth_header = f"{token_type} {token}"
                         self._connection._session.headers["Authorization"] = auth_header
+                        self._connection._jwt_authenticated = True
                         logger.debug("Set Authorization header to: %s ...", auth_header[:50])
                     except Exception as e:
                         logger.warning("Failed to set Authorization header: %s", e)
@@ -575,6 +576,9 @@ class Connection:
         self._ssl = ssl
         self._timeout = timeout
         self._closed = False
+        self._jwt_authenticated = False
+        self._odata_service_document_cache: Optional[List[Dict[str, Any]]] = None
+        self._odata_metadata_cache: Optional[Dict[str, List[Tuple[str, str, bool]]]] = None
 
         # Build base URL
         scheme = "https" if ssl else "http"
@@ -621,6 +625,113 @@ class Connection:
         if (self._ssl and self._port == 443) or (not self._ssl and self._port == 80):
             return f"{scheme}://{data_host}"
         return f"{scheme}://{data_host}:{self._port}"
+
+    def _odata_base_url(self) -> str:
+        """Construct a base URL that targets the 'odata' subdomain for metadata requests."""
+        scheme = "https" if self._ssl else "http"
+        domain = self._normalize_domain(self._host)
+        if "." in domain and not domain.startswith("localhost"):
+            odata_host = f"odata.{domain}"
+        else:
+            odata_host = domain
+        if (self._ssl and self._port == 443) or (not self._ssl and self._port == 80):
+            return f"{scheme}://{odata_host}"
+        return f"{scheme}://{odata_host}:{self._port}"
+
+    def _ensure_authenticated(self) -> None:
+        """Trigger the client-credentials auth flow if it hasn't run yet.
+
+        Authentication normally happens as a side effect of creating a Cursor
+        (see Cursor.__init__). Introspection calls can run before any query
+        cursor exists, so they need to force it explicitly.
+        """
+        if not self._jwt_authenticated:
+            self.cursor()
+
+    # $metadata generation is observed to take ~30s server-side regardless of
+    # payload size (~50KB) — give it more headroom than a typical query timeout.
+    _ODATA_METADATA_TIMEOUT = 90.0
+
+    def get_odata_service_document(self) -> List[Dict[str, Any]]:
+        """Fetch the OData service document listing all EntitySets visible to this token.
+
+        Cached for the lifetime of this connection: SQLAlchemy reflection
+        calls this once per has_table/get_table_names/get_columns/etc, and
+        the underlying request is not cheap.
+
+        Returns:
+            List of entity descriptors, each with at least "name" (dotted, e.g.
+            "public.examples.planets"), "kind" ("EntitySet"), and "source"
+            ("Table" or "View"). Returns an empty list on failure.
+        """
+        if self._odata_service_document_cache is not None:
+            return self._odata_service_document_cache
+
+        self._check_closed()
+        self._ensure_authenticated()
+        url = urljoin(self._odata_base_url() + "/", "api/v4/")
+        try:
+            response = self._session.get(url, timeout=self._ODATA_METADATA_TIMEOUT)
+            response.raise_for_status()
+            entities = response.json().get("value", [])
+            self._odata_service_document_cache = entities
+            return entities
+        except requests.exceptions.RequestException as e:
+            logger.warning("Failed to fetch OData service document: %s", e)
+            return []
+        except ValueError as e:
+            logger.warning("Failed to parse OData service document: %s", e)
+            return []
+
+    def get_odata_metadata(self) -> Dict[str, List[Tuple[str, str, bool]]]:
+        """Fetch and parse the OData $metadata document.
+
+        Cached for the lifetime of this connection (see get_odata_service_document).
+
+        Returns:
+            Mapping of EntityType name (dots replaced with underscores, e.g.
+            "public_examples_planets") to a list of
+            (property_name, edm_type, nullable) tuples. Returns an empty dict
+            on failure.
+        """
+        if self._odata_metadata_cache is not None:
+            return self._odata_metadata_cache
+
+        self._check_closed()
+        self._ensure_authenticated()
+        url = urljoin(self._odata_base_url() + "/", "api/v4/$metadata")
+        try:
+            response = self._session.get(url, timeout=self._ODATA_METADATA_TIMEOUT)
+            response.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            logger.warning("Failed to fetch OData metadata: %s", e)
+            return {}
+
+        import xml.etree.ElementTree as ET
+
+        edm_ns = "{http://docs.oasis-open.org/odata/ns/edm}"
+        entity_types: Dict[str, List[Tuple[str, str, bool]]] = {}
+        try:
+            root = ET.fromstring(response.content)
+        except ET.ParseError as e:
+            logger.warning("Failed to parse OData $metadata XML: %s", e)
+            return {}
+
+        for entity_type in root.iter(f"{edm_ns}EntityType"):
+            name = entity_type.get("Name")
+            if not name:
+                continue
+            properties = []
+            for prop in entity_type.findall(f"{edm_ns}Property"):
+                prop_name = prop.get("Name")
+                if not prop_name:
+                    continue
+                prop_type = prop.get("Type", "Edm.String")
+                nullable = prop.get("Nullable", "true").lower() == "true"
+                properties.append((prop_name, prop_type, nullable))
+            entity_types[name] = properties
+        self._odata_metadata_cache = entity_types
+        return entity_types
 
     def _check_closed(self) -> None:
         """Raise exception if connection is closed."""

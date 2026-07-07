@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 from unittest.mock import patch
 
 import pytest
+import requests
 from sqlalchemy_dialect import dbapi
 from sqlalchemy_dialect.dialect import OpteryxDialect
 from sqlalchemy_dialect.dialect import _quote_identifier
@@ -124,6 +125,141 @@ class TestConnection:
         conn = dbapi.Connection()
         conn.rollback()  # Should not raise
         conn.close()
+
+    def test_odata_base_url(self):
+        """Test that the odata subdomain is derived the same way as the jobs subdomain."""
+        conn = dbapi.Connection(host="opteryx.app", port=443, ssl=True)
+        assert conn._odata_base_url() == "https://odata.opteryx.app"
+        conn.close()
+
+        conn = dbapi.Connection(host="jobs.opteryx.app", port=443, ssl=True)
+        assert conn._odata_base_url() == "https://odata.opteryx.app"
+        conn.close()
+
+        conn = dbapi.Connection(host="localhost", port=8000, ssl=False)
+        assert conn._odata_base_url() == "http://localhost:8000"
+        conn.close()
+
+    @patch("requests.Session.get")
+    @patch("requests.Session.post")
+    def test_ensure_authenticated_triggers_jwt_flow(self, mock_post, mock_get):
+        """A pre-configured token header is not proof of a completed JWT exchange."""
+        post_response = MagicMock()
+        post_response.status_code = 200
+        post_response.json.return_value = {"access_token": "jwt-token", "token_type": "bearer"}
+        mock_post.return_value = post_response
+
+        conn = dbapi.Connection(host="opteryx.app", username="user", token="raw-token", ssl=True)
+        # Seeded from the raw token before any JWT exchange has happened.
+        assert conn._session.headers["Authorization"] == "Bearer raw-token"
+        assert conn._jwt_authenticated is False
+
+        conn._ensure_authenticated()
+
+        assert conn._jwt_authenticated is True
+        assert conn._session.headers["Authorization"] == "Bearer jwt-token"
+        mock_post.assert_called_once()
+
+    @patch("requests.Session.get")
+    @patch("requests.Session.post")
+    def test_get_odata_service_document(self, mock_post, mock_get):
+        """Test fetching and caching the OData service document."""
+        post_response = MagicMock()
+        post_response.status_code = 200
+        post_response.json.return_value = {"access_token": "jwt-token", "token_type": "bearer"}
+        mock_post.return_value = post_response
+
+        get_response = MagicMock()
+        get_response.status_code = 200
+        get_response.json.return_value = {
+            "value": [
+                {"name": "public.examples.planets", "kind": "EntitySet", "source": "Table"},
+                {"name": "public.examples.a_view", "kind": "EntitySet", "source": "View"},
+            ]
+        }
+        mock_get.return_value = get_response
+
+        conn = dbapi.Connection(host="opteryx.app", username="user", token="raw-token", ssl=True)
+        entities = conn.get_odata_service_document()
+        assert entities == [
+            {"name": "public.examples.planets", "kind": "EntitySet", "source": "Table"},
+            {"name": "public.examples.a_view", "kind": "EntitySet", "source": "View"},
+        ]
+
+        # Second call should be served from cache, not a second HTTP request.
+        conn.get_odata_service_document()
+        assert mock_get.call_count == 1
+
+    @patch("requests.Session.get")
+    @patch("requests.Session.post")
+    def test_get_odata_service_document_failure_returns_empty(self, mock_post, mock_get):
+        """Test that a failed request degrades to an empty list rather than raising."""
+        post_response = MagicMock()
+        post_response.status_code = 200
+        post_response.json.return_value = {"access_token": "jwt-token", "token_type": "bearer"}
+        mock_post.return_value = post_response
+        mock_get.side_effect = requests.exceptions.ConnectionError("boom")
+
+        conn = dbapi.Connection(host="opteryx.app", username="user", token="raw-token", ssl=True)
+        assert conn.get_odata_service_document() == []
+
+    @patch("requests.Session.get")
+    @patch("requests.Session.post")
+    def test_get_odata_metadata(self, mock_post, mock_get):
+        """Test fetching and parsing the OData $metadata document."""
+        post_response = MagicMock()
+        post_response.status_code = 200
+        post_response.json.return_value = {"access_token": "jwt-token", "token_type": "bearer"}
+        mock_post.return_value = post_response
+
+        metadata_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<edmx:Edmx xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx" Version="4.0">
+  <edmx:DataServices>
+    <Schema Namespace="OData" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="public_examples_planets">
+        <Key><PropertyRef Name="id" /></Key>
+        <Property Name="id" Type="Edm.Int64" Nullable="false" />
+        <Property Name="name" Type="Edm.String" Nullable="true" />
+        <Property Name="mass" Type="Edm.Double" Nullable="true" />
+      </EntityType>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>"""
+        get_response = MagicMock()
+        get_response.status_code = 200
+        get_response.content = metadata_xml.encode("utf-8")
+        mock_get.return_value = get_response
+
+        conn = dbapi.Connection(host="opteryx.app", username="user", token="raw-token", ssl=True)
+        metadata = conn.get_odata_metadata()
+        assert metadata == {
+            "public_examples_planets": [
+                ("id", "Edm.Int64", False),
+                ("name", "Edm.String", True),
+                ("mass", "Edm.Double", True),
+            ]
+        }
+
+        # Second call should be served from cache, not a second HTTP request.
+        conn.get_odata_metadata()
+        assert mock_get.call_count == 1
+
+    @patch("requests.Session.get")
+    @patch("requests.Session.post")
+    def test_get_odata_metadata_malformed_xml_returns_empty(self, mock_post, mock_get):
+        """Test that malformed XML degrades to an empty dict rather than raising."""
+        post_response = MagicMock()
+        post_response.status_code = 200
+        post_response.json.return_value = {"access_token": "jwt-token", "token_type": "bearer"}
+        mock_post.return_value = post_response
+
+        get_response = MagicMock()
+        get_response.status_code = 200
+        get_response.content = b"<not><valid"
+        mock_get.return_value = get_response
+
+        conn = dbapi.Connection(host="opteryx.app", username="user", token="raw-token", ssl=True)
+        assert conn.get_odata_metadata() == {}
 
 
 class TestCursor:
@@ -451,6 +587,127 @@ class TestDialect:
         """Test isolation level (always AUTOCOMMIT)."""
         dialect = OpteryxDialect()
         assert dialect.get_isolation_level(None) == "AUTOCOMMIT"
+
+
+class TestIntrospection:
+    """Tests for OData-backed schema introspection (has_table, get_columns, etc)."""
+
+    SERVICE_DOCUMENT = [
+        {"name": "public.examples.planets", "kind": "EntitySet", "source": "Table"},
+        {"name": "public.examples.moons", "kind": "EntitySet", "source": "Table"},
+        {"name": "public.examples.a_view", "kind": "EntitySet", "source": "View"},
+        {"name": "personal.bastian.customers", "kind": "EntitySet", "source": "Table"},
+    ]
+
+    METADATA = {
+        "public_examples_planets": [
+            ("id", "Edm.Int64", False),
+            ("name", "Edm.String", True),
+            ("mass", "Edm.Double", True),
+        ],
+    }
+
+    @staticmethod
+    def _fake_sa_connection(service_document=None, metadata=None):
+        """Build a stand-in for the SQLAlchemy Connection dialect methods receive.
+
+        Only the `.connection.dbapi_connection` access path used by
+        `_dbapi_connection()` needs to work.
+        """
+        from sqlalchemy_dialect import dialect as dialect_module
+
+        raw_connection = MagicMock()
+        raw_connection.get_odata_service_document.return_value = service_document or []
+        raw_connection.get_odata_metadata.return_value = metadata or {}
+        sa_connection = MagicMock()
+        sa_connection.connection.dbapi_connection = raw_connection
+        return sa_connection, dialect_module
+
+    def test_dbapi_connection_helper(self):
+        """Test that _dbapi_connection reaches through to the raw driver connection."""
+        from sqlalchemy_dialect.dialect import _dbapi_connection
+
+        sa_connection, _ = self._fake_sa_connection()
+        assert _dbapi_connection(sa_connection) is sa_connection.connection.dbapi_connection
+
+    def test_edm_type_mapping(self):
+        """Test Edm.* -> SQLAlchemy type mapping, including an unknown fallback."""
+        from sqlalchemy import types as sqltypes
+        from sqlalchemy_dialect.dialect import _edm_type_to_sqlalchemy
+
+        assert _edm_type_to_sqlalchemy("Edm.Int64") is sqltypes.BigInteger
+        assert _edm_type_to_sqlalchemy("Edm.String") is sqltypes.String
+        assert _edm_type_to_sqlalchemy("Edm.Double") is sqltypes.Float
+        assert _edm_type_to_sqlalchemy("Edm.Boolean") is sqltypes.Boolean
+        # Unknown/unmapped Edm types fall back to String rather than raising.
+        assert _edm_type_to_sqlalchemy("Edm.SomeFutureType") is sqltypes.String
+
+    def test_has_table_true(self):
+        """Test has_table for an entity present in the service document."""
+        sa_connection, dialect_module = self._fake_sa_connection(self.SERVICE_DOCUMENT)
+        dialect = OpteryxDialect()
+        assert dialect.has_table(sa_connection, "planets", schema="public.examples") is True
+
+    def test_has_table_false(self):
+        """Test has_table for an entity absent from the service document."""
+        sa_connection, _ = self._fake_sa_connection(self.SERVICE_DOCUMENT)
+        dialect = OpteryxDialect()
+        assert dialect.has_table(sa_connection, "does_not_exist", schema="public.examples") is False
+
+    def test_has_table_no_schema(self):
+        """Test has_table using a fully-dotted table_name with no separate schema."""
+        sa_connection, _ = self._fake_sa_connection(self.SERVICE_DOCUMENT)
+        dialect = OpteryxDialect()
+        assert dialect.has_table(sa_connection, "public.examples.planets") is True
+
+    def test_get_table_names_scoped(self):
+        """Test get_table_names filters by schema and strips the dotted prefix."""
+        sa_connection, _ = self._fake_sa_connection(self.SERVICE_DOCUMENT)
+        dialect = OpteryxDialect()
+        tables = dialect.get_table_names(sa_connection, schema="public.examples")
+        assert tables == ["planets", "moons"]
+
+    def test_get_table_names_unscoped(self):
+        """Test get_table_names with no schema returns full dotted names, tables only."""
+        sa_connection, _ = self._fake_sa_connection(self.SERVICE_DOCUMENT)
+        dialect = OpteryxDialect()
+        tables = dialect.get_table_names(sa_connection)
+        assert tables == ["public.examples.planets", "public.examples.moons", "personal.bastian.customers"]
+
+    def test_get_view_names(self):
+        """Test get_view_names only returns entities with source == 'View'."""
+        sa_connection, _ = self._fake_sa_connection(self.SERVICE_DOCUMENT)
+        dialect = OpteryxDialect()
+        views = dialect.get_view_names(sa_connection, schema="public.examples")
+        assert views == ["a_view"]
+
+    def test_get_schema_names(self):
+        """Test get_schema_names derives distinct dotted prefixes."""
+        sa_connection, _ = self._fake_sa_connection(self.SERVICE_DOCUMENT)
+        dialect = OpteryxDialect()
+        schemas = dialect.get_schema_names(sa_connection)
+        assert schemas == ["personal.bastian", "public.examples"]
+
+    def test_get_columns(self):
+        """Test get_columns parses $metadata into SQLAlchemy column dicts."""
+        from sqlalchemy import types as sqltypes
+
+        sa_connection, _ = self._fake_sa_connection(metadata=self.METADATA)
+        dialect = OpteryxDialect()
+        columns = dialect.get_columns(sa_connection, "planets", schema="public.examples")
+
+        assert [c["name"] for c in columns] == ["id", "name", "mass"]
+        assert columns[0]["type"] is sqltypes.BigInteger
+        assert columns[0]["nullable"] is False
+        assert columns[1]["type"] is sqltypes.String
+        assert columns[1]["nullable"] is True
+        assert columns[2]["type"] is sqltypes.Float
+
+    def test_get_columns_unknown_table(self):
+        """Test get_columns returns an empty list for a table absent from $metadata."""
+        sa_connection, _ = self._fake_sa_connection(metadata=self.METADATA)
+        dialect = OpteryxDialect()
+        assert dialect.get_columns(sa_connection, "does_not_exist", schema="public.examples") == []
 
 
 class TestConnect:

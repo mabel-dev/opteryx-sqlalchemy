@@ -31,6 +31,38 @@ from . import dbapi
 logger = logging.getLogger("sqlalchemy.dialects.opteryx")
 
 
+_EDM_TYPE_MAP = {
+    "Edm.String": sqltypes.String,
+    "Edm.Boolean": sqltypes.Boolean,
+    "Edm.Byte": sqltypes.SmallInteger,
+    "Edm.SByte": sqltypes.SmallInteger,
+    "Edm.Int16": sqltypes.SmallInteger,
+    "Edm.Int32": sqltypes.Integer,
+    "Edm.Int64": sqltypes.BigInteger,
+    "Edm.Single": sqltypes.Float,
+    "Edm.Double": sqltypes.Float,
+    "Edm.Decimal": sqltypes.Numeric,
+    "Edm.Date": sqltypes.Date,
+    "Edm.TimeOfDay": sqltypes.Time,
+    "Edm.DateTimeOffset": sqltypes.DateTime,
+    "Edm.Binary": sqltypes.LargeBinary,
+}
+
+
+def _edm_type_to_sqlalchemy(edm_type: str) -> Any:
+    """Map an OData Edm.* primitive type name to a SQLAlchemy type."""
+    return _EDM_TYPE_MAP.get(edm_type, sqltypes.String)
+
+
+def _dbapi_connection(connection: Any) -> Any:
+    """Get the underlying opteryx dbapi Connection from a SQLAlchemy Connection.
+
+    Reuses the connection's already-authenticated HTTP session rather than
+    opening a new one, so introspection doesn't repeat the auth handshake.
+    """
+    return connection.connection.dbapi_connection
+
+
 def _quote_identifier(identifier: str) -> str:
     """Safely quote a SQL identifier to prevent SQL injection.
 
@@ -224,6 +256,9 @@ class OpteryxDialect(default.DefaultDialect):
     ) -> bool:
         """Check if a table exists.
 
+        Backed by the OData service document rather than a SQL query, so this
+        costs a metadata lookup instead of a billed query execution.
+
         Args:
             connection: SQLAlchemy connection
             table_name: Name of the table
@@ -232,24 +267,9 @@ class OpteryxDialect(default.DefaultDialect):
         Returns:
             True if the table exists
         """
-        # Try to query the table with a limit of 0 to check existence
-        try:
-            # Safely quote identifiers to prevent SQL injection
-            quoted_table = _quote_identifier(table_name)
-            if schema:
-                quoted_schema = _quote_identifier(schema)
-                full_name = f"{quoted_schema}.{quoted_table}"
-            else:
-                full_name = quoted_table
-            logger.debug("Checking if table exists: %s", full_name)
-            result = connection.execute(f"SELECT * FROM {full_name} LIMIT 0")
-            result.close()
-            logger.debug("Table exists: %s", full_name)
-            return True
-        except (ValueError, Exception) as e:
-            # ValueError from invalid identifier, or database error
-            logger.debug("Table does not exist or error checking: %s - %s", table_name, e)
-            return False
+        full_name = f"{schema}.{table_name}" if schema else table_name
+        entities = _dbapi_connection(connection).get_odata_service_document()
+        return any(e.get("name") == full_name for e in entities)
 
     def get_columns(
         self,
@@ -258,11 +278,22 @@ class OpteryxDialect(default.DefaultDialect):
         schema: Optional[str] = None,
         **kw: Any,
     ) -> list:
-        """Get column information for a table.
-
-        Returns an empty list as Opteryx may not support full introspection.
-        """
-        return []
+        """Get column information for a table from the OData $metadata document."""
+        full_name = f"{schema}.{table_name}" if schema else table_name
+        entity_type_name = full_name.replace(".", "_")
+        metadata = _dbapi_connection(connection).get_odata_metadata()
+        properties = metadata.get(entity_type_name)
+        if not properties:
+            return []
+        return [
+            {
+                "name": prop_name,
+                "type": _edm_type_to_sqlalchemy(edm_type),
+                "nullable": nullable,
+                "default": None,
+            }
+            for prop_name, edm_type, nullable in properties
+        ]
 
     def get_pk_constraint(
         self,
@@ -303,35 +334,46 @@ class OpteryxDialect(default.DefaultDialect):
         """
         return []
 
-    def get_table_names(self, connection: Any, schema: Optional[str] = None, **kw: Any) -> list:
-        """Get list of table names.
+    def _get_entity_names(self, connection: Any, schema: Optional[str], source: str) -> list:
+        """Shared helper: entity names of a given OData `source` ("Table" or "View").
 
-        Attempts to query Opteryx for available tables.
+        If `schema` is given, names are scoped to that dotted prefix and
+        returned with the prefix stripped; otherwise the full dotted name is
+        returned (Opteryx datasets are commonly addressed in dotted form,
+        e.g. "public.examples.planets").
         """
-        try:
-            result = connection.execute("SHOW TABLES")
-            tables = [row[0] for row in result.fetchall()]
-            result.close()
-            return tables
-        except Exception:
-            return []
+        entities = _dbapi_connection(connection).get_odata_service_document()
+        prefix = f"{schema}." if schema else None
+        names = []
+        for entity in entities:
+            if entity.get("kind") != "EntitySet" or entity.get("source") != source:
+                continue
+            full_name = entity.get("name", "")
+            if prefix:
+                if not full_name.startswith(prefix):
+                    continue
+                names.append(full_name[len(prefix) :])
+            else:
+                names.append(full_name)
+        return names
+
+    def get_table_names(self, connection: Any, schema: Optional[str] = None, **kw: Any) -> list:
+        """Get list of table names from the OData service document."""
+        return self._get_entity_names(connection, schema, "Table")
 
     def get_view_names(self, connection: Any, schema: Optional[str] = None, **kw: Any) -> list:
-        """Get list of view names.
-
-        Opteryx may not distinguish between tables and views.
-        """
-        return []
+        """Get list of view names from the OData service document."""
+        return self._get_entity_names(connection, schema, "View")
 
     def get_schema_names(self, connection: Any, **kw: Any) -> list:
-        """Get list of schema names."""
-        try:
-            result = connection.execute("SHOW SCHEMAS")
-            schemas = [row[0] for row in result.fetchall()]
-            result.close()
-            return schemas
-        except Exception:
-            return ["default"]
+        """Get list of schema names, derived from the dotted prefixes of known entities."""
+        entities = _dbapi_connection(connection).get_odata_service_document()
+        schemas = set()
+        for entity in entities:
+            full_name = entity.get("name", "")
+            if "." in full_name:
+                schemas.add(full_name.rsplit(".", 1)[0])
+        return sorted(schemas)
 
     def _get_server_version_info(self, connection: Any) -> Tuple[int, ...]:
         """Get server version information."""
