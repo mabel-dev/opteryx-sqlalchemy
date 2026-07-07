@@ -12,6 +12,7 @@ This project packages a SQLAlchemy dialect and lightweight DBAPI 2.0 adapter tha
 - Read-only analytics with transparent polling of query status and incremental result streaming.
 - Lightweight DBAPI implementation that maps Opteryx types to SQLAlchemy while surfacing DatabaseError/OperationalError semantics.
 - Compatible with SQLAlchemy 2.x usage patterns, including context-managed engines and `text` queries.
+- Schema introspection (`inspect(engine)`) — list schemas, tables, views, and columns (with types) without running SQL.
 - Work with pandas, dbt, or other tooling that understands SQLAlchemy engines.
 - **Comprehensive debug logging** for troubleshooting connection, authentication, and query execution issues.
 - Install from PyPI (`pip install opteryx-sqlalchemy`) or lock into editable mode for development.
@@ -129,10 +130,54 @@ Note: this requires pandas to be installed in your environment.
 
 ---
 
+## Schema Introspection 🔍
+
+Use SQLAlchemy's `inspect()` to browse schemas, tables, views, and columns without writing SQL:
+
+```python
+from sqlalchemy import create_engine, inspect
+
+engine = create_engine(
+    "opteryx://myusername:mytoken@opteryx.app:443/default?ssl=true"
+)
+
+with engine.connect() as conn:
+    insp = inspect(conn)
+
+    # List every schema (namespace) visible to this token
+    print(insp.get_schema_names())
+    # ['personal.bastian', 'public.examples', 'public.github', ...]
+
+    # List tables — scoped to a schema, or unscoped for full dotted names
+    print(insp.get_table_names(schema="public.examples"))
+    # ['planets', 'moons', 'users']
+    print(insp.get_table_names())
+    # ['public.examples.planets', 'public.examples.moons', ...]
+
+    # Views are listed separately from tables
+    print(insp.get_view_names(schema="public.examples"))
+
+    # Check whether a table exists
+    print(insp.has_table("public.examples.planets"))
+    # True
+
+    # Get column names and types
+    for column in insp.get_columns("planets", schema="public.examples"):
+        print(column["name"], column["type"], "nullable:", column["nullable"])
+    # id BIGINT nullable: False
+    # name VARCHAR nullable: True
+    # mass FLOAT nullable: True
+    # ...
+```
+
+Introspection is backed by Opteryx's OData metadata endpoints rather than SQL queries, so it doesn't cost a billed query execution. The first call that needs table schemas (`get_columns`, or `has_table`/`get_table_names` the first time) can take longer than a typical query — full metadata generation is a heavier server-side operation — but the result is cached for the lifetime of the connection, so repeated calls (e.g. reflecting many tables) don't re-pay that cost.
+
+---
+
 ## Behavior and Limitations ⚠️
 
 - Opteryx is primarily an analytics engine — the dialect treats the service as read-only. Transactional features are effectively no-ops.
-- Not all SQLAlchemy reflection/introspection features are available. Some schema introspection operations may return empty results or limited metadata.
+- Schema introspection (`has_table`, `get_table_names`, `get_view_names`, `get_schema_names`, `get_columns`) is supported. Opteryx has no primary keys, foreign keys, or indexes, so `get_pk_constraint`/`get_foreign_keys`/`get_indexes` always return empty.
 - The dialect maps Opteryx native types to SQLAlchemy types as best-effort but does not implement a complete type mapping for every possible backend type.
 - If execution fails or times out, the DBAPI will raise an appropriate exception (subclass of DatabaseError/OperationalError).
 
