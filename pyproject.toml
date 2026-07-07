@@ -20,6 +20,9 @@ dependencies = [
 [project.entry-points."sqlalchemy.dialects"]
 opteryx = "sqlalchemy_dialect.dialect:OpteryxDialect"
 
+[tool.setuptools]
+packages = ["sqlalchemy_dialect"]
+
 [tool.isort]
 profile = "black"
 extend_skip_glob = ["tests/**"]
