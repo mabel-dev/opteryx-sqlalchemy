@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 from sqlalchemy_dialect import dbapi
-from sqlalchemy_dialect.dialect import OptetyxDialect
+from sqlalchemy_dialect.dialect import OpteryxDialect
 from sqlalchemy_dialect.dialect import _quote_identifier
 
 
@@ -406,20 +406,20 @@ class TestDialect:
 
     def test_dialect_name(self):
         """Test dialect name."""
-        dialect = OptetyxDialect()
+        dialect = OpteryxDialect()
         assert dialect.name == "opteryx"
         assert dialect.driver == "http"
 
     def test_dialect_dbapi(self):
         """Test that dialect returns correct DBAPI module."""
-        assert OptetyxDialect.dbapi() is dbapi
-        assert OptetyxDialect.import_dbapi() is dbapi
+        assert OpteryxDialect.dbapi() is dbapi
+        assert OpteryxDialect.import_dbapi() is dbapi
 
     def test_create_connect_args_minimal(self):
         """Test create_connect_args with minimal URL."""
         from sqlalchemy.engine.url import make_url
 
-        dialect = OptetyxDialect()
+        dialect = OpteryxDialect()
         url = make_url("opteryx://localhost/default")
         args, kwargs = dialect.create_connect_args(url)
 
@@ -432,7 +432,7 @@ class TestDialect:
         """Test create_connect_args with full URL."""
         from sqlalchemy.engine.url import make_url
 
-        dialect = OptetyxDialect()
+        dialect = OpteryxDialect()
         url = make_url("opteryx://user:token123@opteryx.app:443/mydb?ssl=true&timeout=60")
         args, kwargs = dialect.create_connect_args(url)
 
@@ -447,7 +447,7 @@ class TestDialect:
 
     def test_dialect_capabilities(self):
         """Test dialect capability flags."""
-        dialect = OptetyxDialect()
+        dialect = OpteryxDialect()
         assert dialect.supports_alter is False
         assert dialect.supports_sequences is False
         assert dialect.supports_native_boolean is True
@@ -455,7 +455,7 @@ class TestDialect:
 
     def test_get_isolation_level(self):
         """Test isolation level (always AUTOCOMMIT)."""
-        dialect = OptetyxDialect()
+        dialect = OpteryxDialect()
         assert dialect.get_isolation_level(None) == "AUTOCOMMIT"
 
 

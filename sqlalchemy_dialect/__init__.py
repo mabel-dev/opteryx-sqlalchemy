@@ -14,6 +14,6 @@ Usage:
     )
 """
 
-from .dialect import OptetyxDialect
+from .dialect import OpteryxDialect
 
-__all__ = ["OptetyxDialect"]
+__all__ = ["OpteryxDialect"]

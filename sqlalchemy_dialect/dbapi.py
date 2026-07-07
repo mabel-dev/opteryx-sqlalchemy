@@ -124,6 +124,7 @@ class Cursor:
         self._opteryx_execution_options: dict = {}
         self._opteryx_stream_results_requested: bool = False
         self._opteryx_max_row_buffer: Optional[int] = None
+        self._opteryx_result_format: str = "json"
 
         # Try to authenticate using client credentials (client credentials flow)
         # client_id is connection._username and client_secret is connection._token
@@ -462,7 +463,10 @@ class Cursor:
                 break
 
             result = self._connection._get_statement_results(  # pylint: disable=protected-access
-                self._statement_handle, num_rows=page_size, offset=offset
+                self._statement_handle,
+                num_rows=page_size,
+                offset=offset,
+                file_format=self._opteryx_result_format,
             )
 
             fetched_this_page = process_result_page(result)
@@ -716,7 +720,11 @@ class Connection:
             raise OperationalError(f"Connection error: {e}") from e
 
     def _get_statement_results(
-        self, statement_handle: str, num_rows: Optional[int] = None, offset: Optional[int] = None
+        self,
+        statement_handle: str,
+        num_rows: Optional[int] = None,
+        offset: Optional[int] = None,
+        file_format: str = "json",
     ) -> Dict[str, Any]:
         """Get results for a completed statement using the /download endpoint.
 
@@ -724,29 +732,50 @@ class Connection:
             statement_handle: The execution ID returned by submit
             num_rows: Maximum number of rows to return (maps to 'limit' param)
             offset: Row offset for pagination
+            file_format: "json" (NDJSON, default) or "parquet"
 
         Returns:
             Dictionary containing the result data in a format compatible with process_result_page.
-            The download endpoint returns NDJSON (newline-delimited JSON), so we parse it and
-            convert to the expected format.
+            The download endpoint returns NDJSON (newline-delimited JSON) or Parquet bytes,
+            depending on file_format; both are normalised to the same row-dict shape here.
         """
         url = urljoin(self._data_base_url() + "/", f"api/v1/jobs/{statement_handle}/download")
-        params: Dict[str, Any] = {"file_format": "json"}
+        params: Dict[str, Any] = {"file_format": file_format}
         if num_rows is not None:
             params["limit"] = int(num_rows)
         if offset is not None:
             params["offset"] = int(offset)
 
         logger.debug(
-            "Fetching results for execution_id: %s (limit=%s, offset=%s)",
+            "Fetching results for execution_id: %s (limit=%s, offset=%s, file_format=%s)",
             statement_handle,
             num_rows,
             offset,
+            file_format,
         )
 
         try:
             response = self._session.get(url, params=params, timeout=self._timeout)
             response.raise_for_status()
+
+            if file_format == "parquet":
+                from rugo import parquet as rugo_parquet
+
+                rows = []
+                columns: Optional[List[str]] = None
+                with rugo_parquet.read_parquet(bytes(response.content)) as reader:
+                    for morsel in reader:
+                        if columns is None:
+                            columns = [
+                                name.decode("utf-8") if isinstance(name, bytes) else name
+                                for name in morsel.column_names
+                            ]
+                        for row in morsel:
+                            rows.append(dict(zip(columns, row)))
+
+                result = {"data": rows, "columns": [{"name": col} for col in (columns or [])]}
+                logger.debug("Fetched %d rows from download endpoint (parquet)", len(rows))
+                return result
 
             # The download endpoint returns NDJSON (newline-delimited JSON)
             # Parse each line as a separate JSON object (row)
