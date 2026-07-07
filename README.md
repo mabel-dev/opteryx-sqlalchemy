@@ -56,6 +56,8 @@ pip install opteryx-sqlalchemy
 
 ---
 
+See [`notebooks/quickstart.ipynb`](notebooks/quickstart.ipynb) for a runnable walkthrough covering all of the below (connecting, queries, pandas, execution options, and introspection) in one notebook.
+
 ## Quickstart — SQLAlchemy Core / Engine
 
 Basic usage with SQLAlchemy 2.x:
@@ -70,20 +72,17 @@ engine = create_engine(
 
 with engine.connect() as conn:
     # Run a simple query
-    result = conn.execute(text("SELECT * FROM public.examples.users LIMIT 10"))
+    result = conn.execute(text("SELECT id, name FROM public.astronomy.planets LIMIT 10"))
     for row in result:
         print(row)
-
-    # Parameterized query example
-    stmt = text("SELECT * FROM events WHERE user_id = :uid")
-    result = conn.execute(stmt, {"uid": 123})
-    print(result.fetchall())
 ```
 
 **Connection String Format:**
 - Replace `myusername` with your Opteryx username
 - Replace `mytoken` with your Opteryx authentication token
 - For Opteryx Cloud, always use `opteryx.app:443` with `ssl=true`
+
+> **Note on bound parameters:** the Opteryx Cloud API accepts a `parameters` field, but it is not yet wired up to `:name` placeholders in the query text — a query with an unresolved placeholder fails with `ParameterError: Unresolved parameter in query`, regardless of what's passed as parameters. Until that's fixed server-side, `text("... :name ...")` with a `params` dict will not work through this dialect.
 
 ---
 
@@ -122,7 +121,7 @@ engine = create_engine(
     "opteryx://myusername:mytoken@opteryx.app:443/default?ssl=true"
 )
 with engine.connect() as conn:
-    df = pd.read_sql_query("SELECT * FROM public.examples.users LIMIT 100", conn)
+    df = pd.read_sql_query("SELECT * FROM public.astronomy.planets LIMIT 100", conn)
     print(df.head())
 ```
 
@@ -146,23 +145,24 @@ with engine.connect() as conn:
 
     # List every schema (namespace) visible to this token
     print(insp.get_schema_names())
-    # ['personal.bastian', 'public.examples', 'public.github', ...]
+    # ['benchmarks.tpch', 'personal.myusername', 'public.astronomy', ...]
 
     # List tables — scoped to a schema, or unscoped for full dotted names
-    print(insp.get_table_names(schema="public.examples"))
-    # ['planets', 'moons', 'users']
+    print(insp.get_table_names(schema="public.astronomy"))
+    # ['planets']
     print(insp.get_table_names())
-    # ['public.examples.planets', 'public.examples.moons', ...]
+    # ['personal.myusername.customers', 'benchmarks.tpch.customer', ...]
 
     # Views are listed separately from tables
-    print(insp.get_view_names(schema="public.examples"))
+    print(insp.get_view_names(schema="personal.myusername"))
+    # ['audits_as_at_seven_jan', 'cve_count_by_year', ...]
 
     # Check whether a table exists
-    print(insp.has_table("public.examples.planets"))
+    print(insp.has_table("public.astronomy.planets"))
     # True
 
     # Get column names and types
-    for column in insp.get_columns("planets", schema="public.examples"):
+    for column in insp.get_columns("planets", schema="public.astronomy"):
         print(column["name"], column["type"], "nullable:", column["nullable"])
     # id BIGINT nullable: False
     # name VARCHAR nullable: True
