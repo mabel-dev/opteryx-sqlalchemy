@@ -53,14 +53,6 @@ Install the published package from PyPI in any environment:
 pip install opteryx-sqlalchemy
 ```
 
-For contributions or debugging, install the local project in editable mode with the SQLAlchemy extras:
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e '.[sqlalchemy]'
-```
-
 ---
 
 ## Quickstart — SQLAlchemy Core / Engine

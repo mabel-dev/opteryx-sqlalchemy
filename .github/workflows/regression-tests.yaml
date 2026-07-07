@@ -1,24 +1,22 @@
 name: regression tests
 
-on:
-  push
+on: push
 
 jobs:
-
   regression:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v3
+      - uses: actions/checkout@v3
 
-    - uses: actions/setup-python@v4
-      with:
-        python-version: '3.x'
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.x"
 
-    - name: install dependencies
-      run: |
-        python -m pip install -U pip
-        pip install -e .[sqlalchemy]
+      - name: install dependencies
+        run: |
+          python -m pip install -U pip pytest pandas
+          pip install -e .
 
-    - name: run regression tests
-      run: python -m pytest -q sqlalchemy_opteryx/tests
+      - name: run regression tests
+        run: python -m pytest -q tests

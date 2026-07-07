@@ -50,7 +50,7 @@ def _quote_identifier(identifier: str) -> str:
     return f'"{identifier}"'
 
 
-class OptetyxDialect(default.DefaultDialect):
+class OpteryxDialect(default.DefaultDialect):
     """SQLAlchemy dialect for Opteryx data service.
 
     This dialect communicates with the Opteryx data service via HTTP,
@@ -182,11 +182,13 @@ class OptetyxDialect(default.DefaultDialect):
         execution_options = getattr(context, "execution_options", {}) if context is not None else {}
         streaming_requested = bool(execution_options.get("stream_results"))
         max_row_buffer = execution_options.get("max_row_buffer")
+        result_format = execution_options.get("result_format", "json")
 
         # Attach the parsed streaming hints to the DBAPI cursor for later use.
         cursor._opteryx_execution_options = dict(execution_options)
         cursor._opteryx_stream_results_requested = streaming_requested
         cursor._opteryx_max_row_buffer = max_row_buffer
+        cursor._opteryx_result_format = result_format
 
         return super().do_execute(cursor, statement, parameters, context=context)
 
@@ -358,8 +360,8 @@ def register_dialect() -> None:
     from sqlalchemy.dialects import registry
 
     # Register using the correct module path for the installed package
-    registry.register("opteryx", "sqlalchemy_dialect.dialect", "OptetyxDialect")
-    registry.register("opteryx.http", "sqlalchemy_dialect.dialect", "OptetyxDialect")
+    registry.register("opteryx", "sqlalchemy_dialect.dialect", "OpteryxDialect")
+    registry.register("opteryx.http", "sqlalchemy_dialect.dialect", "OpteryxDialect")
 
 
 # Ensure the dialect is registered on import so it works in editable/test mode

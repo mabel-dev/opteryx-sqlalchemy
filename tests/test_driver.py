@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 from sqlalchemy_dialect import dbapi
-from sqlalchemy_dialect.dialect import OptetyxDialect
+from sqlalchemy_dialect.dialect import OpteryxDialect
 from sqlalchemy_dialect.dialect import _quote_identifier
 
 
@@ -69,7 +69,7 @@ class TestConnection:
     def test_connection_init_defaults(self):
         """Test connection initialization with defaults."""
         conn = dbapi.Connection()
-        assert conn._host == "localhost"
+        assert conn._host == "jobs.opteryx.app"
         assert conn._port == 8000
         assert conn._ssl is False
         assert conn._closed is False
@@ -260,17 +260,11 @@ class TestCursor:
             "total_rows": 3,
         }
 
+        # The second page comes from the /download endpoint, which returns NDJSON
+        # in `response.text` rather than a JSON body via `response.json()`.
         second_get = MagicMock()
         second_get.status_code = 200
-        second_get.json.return_value = {
-            "execution_id": "handle-321",
-            "status": {"state": "SUCCEEDED"},
-            "data": [
-                {"name": "id", "type": "INTEGER", "values": [3]},
-                {"name": "name", "type": "STRING", "values": ["c"]},
-            ],
-            "total_rows": 3,
-        }
+        second_get.text = '{"id": 3, "name": "c"}'
 
         # The first call is the status poll, the next two are paginated results
         mock_get.side_effect = [first_get, first_get, second_get]
@@ -406,20 +400,20 @@ class TestDialect:
 
     def test_dialect_name(self):
         """Test dialect name."""
-        dialect = OptetyxDialect()
+        dialect = OpteryxDialect()
         assert dialect.name == "opteryx"
         assert dialect.driver == "http"
 
     def test_dialect_dbapi(self):
         """Test that dialect returns correct DBAPI module."""
-        assert OptetyxDialect.dbapi() is dbapi
-        assert OptetyxDialect.import_dbapi() is dbapi
+        assert OpteryxDialect.dbapi() is dbapi
+        assert OpteryxDialect.import_dbapi() is dbapi
 
     def test_create_connect_args_minimal(self):
         """Test create_connect_args with minimal URL."""
         from sqlalchemy.engine.url import make_url
 
-        dialect = OptetyxDialect()
+        dialect = OpteryxDialect()
         url = make_url("opteryx://localhost/default")
         args, kwargs = dialect.create_connect_args(url)
 
@@ -432,12 +426,12 @@ class TestDialect:
         """Test create_connect_args with full URL."""
         from sqlalchemy.engine.url import make_url
 
-        dialect = OptetyxDialect()
+        dialect = OpteryxDialect()
         url = make_url("opteryx://user:token123@opteryx.app:443/mydb?ssl=true&timeout=60")
         args, kwargs = dialect.create_connect_args(url)
 
         assert args == []
-        assert kwargs["host"] == "jobs.opteryx.app"
+        assert kwargs["host"] == "opteryx.app"
         assert kwargs["port"] == 443
         assert kwargs["username"] == "user"
         assert kwargs["token"] == "token123"
@@ -447,7 +441,7 @@ class TestDialect:
 
     def test_dialect_capabilities(self):
         """Test dialect capability flags."""
-        dialect = OptetyxDialect()
+        dialect = OpteryxDialect()
         assert dialect.supports_alter is False
         assert dialect.supports_sequences is False
         assert dialect.supports_native_boolean is True
@@ -455,7 +449,7 @@ class TestDialect:
 
     def test_get_isolation_level(self):
         """Test isolation level (always AUTOCOMMIT)."""
-        dialect = OptetyxDialect()
+        dialect = OpteryxDialect()
         assert dialect.get_isolation_level(None) == "AUTOCOMMIT"
 
 

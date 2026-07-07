@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opteryx-sqlalchemy"
-version = "0.0.6"
+version = "0.0.7"
 description = "Opteryx SQLAlchemy Dialect"
 requires-python = ">=3.9"
 dependencies = [
@@ -14,10 +14,11 @@ dependencies = [
     "requests>=2.34.2",
     "python-multipart>=0.0.30",
     "sqlalchemy>=2.0.50",
+    "rugo>=0.4.2",
 ]
 
 [project.entry-points."sqlalchemy.dialects"]
-opteryx = "sqlalchemy_dialect.dialect:OptetyxDialect"
+opteryx = "sqlalchemy_dialect.dialect:OpteryxDialect"
 
 [tool.isort]
 profile = "black"

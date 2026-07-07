@@ -35,7 +35,7 @@ DEFAULT_AUTH_URL = "https://authenticate.opteryx.app"
 DEFAULT_DATA_URL = "https://jobs.opteryx.app"
 DEFAULT_CLIENT_ID = os.environ.get("CLIENT_ID")
 DEFAULT_CLIENT_SECRET = os.environ.get("CLIENT_SECRET")
-SQL_STATEMENT = "SELECT * FROM public.examples.planets AS P"
+SQL_STATEMENT = "SELECT * FROM public.security.cisa_kev"
 
 
 def fatal(msg: str) -> None:
