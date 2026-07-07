@@ -69,7 +69,7 @@ class TestConnection:
     def test_connection_init_defaults(self):
         """Test connection initialization with defaults."""
         conn = dbapi.Connection()
-        assert conn._host == "localhost"
+        assert conn._host == "jobs.opteryx.app"
         assert conn._port == 8000
         assert conn._ssl is False
         assert conn._closed is False
@@ -260,17 +260,11 @@ class TestCursor:
             "total_rows": 3,
         }
 
+        # The second page comes from the /download endpoint, which returns NDJSON
+        # in `response.text` rather than a JSON body via `response.json()`.
         second_get = MagicMock()
         second_get.status_code = 200
-        second_get.json.return_value = {
-            "execution_id": "handle-321",
-            "status": {"state": "SUCCEEDED"},
-            "data": [
-                {"name": "id", "type": "INTEGER", "values": [3]},
-                {"name": "name", "type": "STRING", "values": ["c"]},
-            ],
-            "total_rows": 3,
-        }
+        second_get.text = '{"id": 3, "name": "c"}'
 
         # The first call is the status poll, the next two are paginated results
         mock_get.side_effect = [first_get, first_get, second_get]
@@ -437,7 +431,7 @@ class TestDialect:
         args, kwargs = dialect.create_connect_args(url)
 
         assert args == []
-        assert kwargs["host"] == "jobs.opteryx.app"
+        assert kwargs["host"] == "opteryx.app"
         assert kwargs["port"] == 443
         assert kwargs["username"] == "user"
         assert kwargs["token"] == "token123"
