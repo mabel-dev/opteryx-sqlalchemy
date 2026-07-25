@@ -1,5 +1,6 @@
 """Tests for the Opteryx SQLAlchemy dialect."""
 
+import time
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
@@ -8,6 +9,20 @@ import requests
 from sqlalchemy_dialect import dbapi
 from sqlalchemy_dialect.dialect import OpteryxDialect
 from sqlalchemy_dialect.dialect import _quote_identifier
+
+
+class TestRedactSecret:
+    """Tests for the debug-log token redaction helper."""
+
+    def test_redact_secret_keeps_only_trailing_chars(self):
+        assert dbapi._redact_secret("eyJhbGciOiJIUzI1NiJ9.abc123") == "***********************c123"
+
+    def test_redact_secret_short_value_fully_masked(self):
+        assert dbapi._redact_secret("ab") == "**"
+
+    def test_redact_secret_empty_or_none(self):
+        assert dbapi._redact_secret("") == "<empty>"
+        assert dbapi._redact_secret(None) == "<empty>"
 
 
 class TestQuoteIdentifier:
@@ -458,6 +473,149 @@ class TestCursor:
         second_call_url = mock_post.call_args_list[1][0][0]
         assert first_call_url.endswith("authenticate.opteryx.app/token")
         assert second_call_url.endswith("jobs.opteryx.app/api/v1/jobs")
+        conn.close()
+
+    @patch("requests.Session.post")
+    def test_cursor_auth_reuses_unexpired_token(self, mock_post):
+        """A second cursor should not re-authenticate while the cached token is still valid."""
+        auth_response = MagicMock()
+        auth_response.status_code = 200
+        auth_response.text = '{"access_token":"jwt-123","expires_in":3600}'
+        auth_response.json.return_value = {"access_token": "jwt-123", "expires_in": 3600}
+        mock_post.return_value = auth_response
+
+        conn = dbapi.Connection(username="username", token="password", host="jobs.opteryx.app")
+
+        cursor1 = conn.cursor()
+        assert cursor1._jwt_token == "jwt-123"
+        assert mock_post.call_count == 1
+
+        # A second cursor within the token's lifetime should reuse it, not re-authenticate.
+        cursor2 = conn.cursor()
+        assert cursor2._jwt_token == "jwt-123"
+        assert mock_post.call_count == 1
+        conn.close()
+
+    @patch("requests.Session.post")
+    def test_cursor_auth_refreshes_expired_token(self, mock_post):
+        """A new cursor should re-authenticate once the cached token has expired."""
+        auth_response = MagicMock()
+        auth_response.status_code = 200
+        auth_response.text = '{"access_token":"jwt-123","expires_in":3600}'
+        auth_response.json.return_value = {"access_token": "jwt-123", "expires_in": 3600}
+        mock_post.return_value = auth_response
+
+        conn = dbapi.Connection(username="username", token="password", host="jobs.opteryx.app")
+        conn.cursor()
+        assert mock_post.call_count == 1
+
+        # Simulate the token being past its (skew-adjusted) expiry.
+        conn._jwt_token_expiry = time.time() - 1
+
+        refreshed_auth_response = MagicMock()
+        refreshed_auth_response.status_code = 200
+        refreshed_auth_response.text = '{"access_token":"jwt-456","expires_in":3600}'
+        refreshed_auth_response.json.return_value = {"access_token": "jwt-456", "expires_in": 3600}
+        mock_post.return_value = refreshed_auth_response
+
+        cursor2 = conn.cursor()
+        assert cursor2._jwt_token == "jwt-456"
+        assert mock_post.call_count == 2
+        conn.close()
+
+    @patch("requests.Session.post")
+    def test_submit_statement_retries_once_on_401(self, mock_post):
+        """A 401 (e.g. token revoked early) should force re-auth and retry once, then succeed."""
+        initial_auth_response = MagicMock()
+        initial_auth_response.status_code = 200
+        initial_auth_response.text = '{"access_token":"jwt-123"}'
+        initial_auth_response.json.return_value = {"access_token": "jwt-123"}
+
+        unauthorized_response = MagicMock()
+        unauthorized_response.status_code = 401
+        unauthorized_response.json.return_value = {"detail": "token revoked"}
+        unauthorized_response.raise_for_status.side_effect = requests.exceptions.HTTPError(
+            response=unauthorized_response
+        )
+
+        reauth_response = MagicMock()
+        reauth_response.status_code = 200
+        reauth_response.text = '{"access_token":"jwt-456"}'
+        reauth_response.json.return_value = {"access_token": "jwt-456"}
+
+        success_response = MagicMock()
+        success_response.status_code = 201
+        success_response.json.return_value = {"execution_id": "handle-789"}
+
+        mock_post.side_effect = [
+            initial_auth_response,  # conn.cursor() below authenticates
+            unauthorized_response,  # first submit attempt -> 401
+            reauth_response,  # forced re-auth
+            success_response,  # retried submit -> succeeds
+        ]
+
+        conn = dbapi.Connection(username="username", token="password", host="jobs.opteryx.app")
+        conn.cursor()
+
+        result = conn._submit_statement("SELECT 1")
+
+        assert result == {"execution_id": "handle-789"}
+        assert conn._session.headers.get("Authorization") == "Bearer jwt-456"
+        assert mock_post.call_count == 4
+        conn.close()
+
+    @patch("requests.Session.post")
+    def test_submit_statement_401_after_retry_still_raises(self, mock_post):
+        """If the retried request also gets a 401, it should raise rather than retry again."""
+
+        def make_401():
+            resp = MagicMock()
+            resp.status_code = 401
+            resp.json.return_value = {"detail": "still unauthorized"}
+            resp.raise_for_status.side_effect = requests.exceptions.HTTPError(response=resp)
+            return resp
+
+        initial_auth_response = MagicMock()
+        initial_auth_response.status_code = 200
+        initial_auth_response.text = '{"access_token":"jwt-123"}'
+        initial_auth_response.json.return_value = {"access_token": "jwt-123"}
+
+        reauth_response = MagicMock()
+        reauth_response.status_code = 200
+        reauth_response.text = '{"access_token":"jwt-456"}'
+        reauth_response.json.return_value = {"access_token": "jwt-456"}
+
+        mock_post.side_effect = [
+            initial_auth_response,  # conn.cursor() below authenticates
+            make_401(),  # first submit attempt -> 401
+            reauth_response,  # forced re-auth succeeds
+            make_401(),  # retried submit -> 401 again
+        ]
+
+        conn = dbapi.Connection(username="username", token="password", host="jobs.opteryx.app")
+        conn.cursor()
+
+        with pytest.raises(dbapi.OperationalError, match="still unauthorized"):
+            conn._submit_statement("SELECT 1")
+
+        assert mock_post.call_count == 4
+        conn.close()
+
+    @patch("requests.Session.post")
+    def test_submit_statement_401_no_retry_without_client_credentials(self, mock_post):
+        """With a static bearer token (no client_id/secret), there's no token to refresh, so no retry."""
+        resp = MagicMock()
+        resp.status_code = 401
+        resp.json.return_value = {"detail": "Unauthorized"}
+        resp.raise_for_status.side_effect = requests.exceptions.HTTPError(response=resp)
+        mock_post.return_value = resp
+
+        conn = dbapi.Connection(token="static-token")
+
+        with pytest.raises(dbapi.OperationalError, match="Unauthorized"):
+            conn._submit_statement("SELECT 1")
+
+        assert mock_post.call_count == 1
         conn.close()
 
     @patch("requests.Session.post")

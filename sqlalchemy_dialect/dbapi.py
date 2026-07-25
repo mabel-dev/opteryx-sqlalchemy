@@ -35,6 +35,10 @@ apilevel = "2.0"
 threadsafety = 1  # Threads may share the module, but not connections
 paramstyle = "named"  # Named style: WHERE name=:name
 
+# Refresh the client-credentials token this many seconds before its reported
+# expiry, so an in-flight request doesn't race against the token expiring.
+_TOKEN_EXPIRY_SKEW_SECONDS = 30.0
+
 
 class Error(Exception):
     """Base exception for DBAPI errors."""
@@ -104,6 +108,20 @@ DATETIME = str
 ROWID = str
 
 
+def _redact_secret(value: Optional[str], visible: int = 4) -> str:
+    """Redact a secret for logging, keeping only the last few characters visible.
+
+    Enough is kept to distinguish one token from another across log lines
+    (e.g. to confirm a refresh actually rotated the token) without letting a
+    usable credential fragment end up in debug logs.
+    """
+    if not value:
+        return "<empty>"
+    if len(value) <= visible:
+        return "*" * len(value)
+    return f"{'*' * (len(value) - visible)}{value[-visible:]}"
+
+
 class Cursor:
     """DBAPI 2.0 Cursor implementation for Opteryx."""
 
@@ -131,7 +149,12 @@ class Cursor:
         try:
             username = getattr(self._connection, "_username", None)
             secret = getattr(self._connection, "_token", None)
-            if username and secret:
+            token_expiry = getattr(self._connection, "_jwt_token_expiry", None)
+            token_still_valid = token_expiry is None or time.time() < token_expiry
+            if username and secret and self._connection._jwt_authenticated and token_still_valid:
+                logger.debug("Reusing cached authentication token for user: %s", username)
+                self._jwt_token = self._connection._jwt_token
+            elif username and secret:
                 logger.debug("Attempting client credentials authentication for user: %s", username)
                 host = getattr(self._connection, "_host", "localhost")
                 # Normalize domain and build auth host (auth.domain)
@@ -172,6 +195,7 @@ class Cursor:
                 token = body.get("access_token") or body.get("token") or body.get("jwt")
                 if token:
                     self._jwt_token = token
+                    self._connection._jwt_token = token
                     token_type = body.get("token_type", "bearer")
                     # Capitalize token_type properly: "bearer" -> "Bearer"
                     if token_type:
@@ -192,12 +216,27 @@ class Cursor:
                     )
                     if refresh_token:
                         logger.debug("Refresh token received for user: %s", username)
+                    # Track when this token needs replacing so subsequent cursors can
+                    # reuse it instead of re-authenticating on every query.
+                    try:
+                        self._connection._jwt_token_expiry = (
+                            time.time() + float(expires_in) - _TOKEN_EXPIRY_SKEW_SECONDS
+                            if expires_in is not None
+                            else None
+                        )
+                    except (TypeError, ValueError):
+                        logger.debug("Non-numeric expires_in %r; treating token as long-lived", expires_in)
+                        self._connection._jwt_token_expiry = None
                     # Set Authorization header for subsequent requests via the connection session
                     try:
                         auth_header = f"{token_type} {token}"
                         self._connection._session.headers["Authorization"] = auth_header
                         self._connection._jwt_authenticated = True
-                        logger.debug("Set Authorization header to: %s ...", auth_header[:50])
+                        logger.debug(
+                            "Set Authorization header (token_type=%s, token=%s)",
+                            token_type,
+                            _redact_secret(token),
+                        )
                     except Exception as e:
                         logger.warning("Failed to set Authorization header: %s", e)
                 else:
@@ -577,6 +616,8 @@ class Connection:
         self._timeout = timeout
         self._closed = False
         self._jwt_authenticated = False
+        self._jwt_token: Optional[str] = None
+        self._jwt_token_expiry: Optional[float] = None
         self._odata_service_document_cache: Optional[List[Dict[str, Any]]] = None
         self._odata_metadata_cache: Optional[Dict[str, List[Tuple[str, str, bool]]]] = None
 
@@ -738,6 +779,54 @@ class Connection:
         if self._closed:
             raise ProgrammingError("Connection is closed")
 
+    def _force_reauthenticate(self) -> bool:
+        """Force a fresh client-credentials token fetch, bypassing the cache.
+
+        Used to recover from a 401 that means the cached token was revoked or
+        expired earlier than its reported lifetime. Returns False (no-op) when
+        this connection isn't using client-credentials auth, since there's no
+        token to refresh in that case.
+        """
+        if not (self._username and self._token):
+            return False
+        self._jwt_authenticated = False
+        self._jwt_token_expiry = None
+        self.cursor()  # Cursor.__init__ performs the auth handshake as a side effect
+        return True
+
+    def _do_request_with_retry(self, request_callable):
+        """Issue an HTTP request, retrying once after a forced re-auth on HTTP 401.
+
+        Args:
+            request_callable: Zero-arg callable that issues the request and
+                returns the `requests.Response`. Called again on retry, so it
+                must re-read `self._session.headers` (i.e. use `self._session`
+                directly) rather than capturing a stale Authorization header.
+
+        Returns:
+            The successful `requests.Response` (after `raise_for_status()`).
+
+        Raises:
+            requests.exceptions.HTTPError: if the request still fails after a
+                retry, or if retry isn't applicable (not a 401, or this
+                connection has no client-credentials to refresh).
+        """
+        try:
+            response = request_callable()
+            response.raise_for_status()
+            return response
+        except requests.exceptions.HTTPError as e:
+            if (
+                e.response is not None
+                and e.response.status_code == 401
+                and self._force_reauthenticate()
+            ):
+                logger.info("Retrying request once after forced re-authentication (HTTP 401)")
+                response = request_callable()
+                response.raise_for_status()
+                return response
+            raise
+
     def _submit_statement(
         self, sql: str, parameters: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
@@ -758,8 +847,9 @@ class Connection:
         logger.debug("Submitting statement to %s", url)
 
         try:
-            response = self._session.post(url, json=payload, timeout=self._timeout)
-            response.raise_for_status()
+            response = self._do_request_with_retry(
+                lambda: self._session.post(url, json=payload, timeout=self._timeout)
+            )
             result = response.json()
             logger.debug(
                 "Statement submitted successfully, execution_id: %s", result.get("execution_id")
@@ -797,8 +887,9 @@ class Connection:
         logger.debug("Checking status for execution_id: %s", statement_handle)
 
         try:
-            response = self._session.get(url, timeout=self._timeout)
-            response.raise_for_status()
+            response = self._do_request_with_retry(
+                lambda: self._session.get(url, timeout=self._timeout)
+            )
             result = response.json()
             logger.debug("Status check response: %s", result.get("status") or result.get("state"))
             return result
@@ -866,8 +957,9 @@ class Connection:
         )
 
         try:
-            response = self._session.get(url, params=params, timeout=self._timeout)
-            response.raise_for_status()
+            response = self._do_request_with_retry(
+                lambda: self._session.get(url, params=params, timeout=self._timeout)
+            )
 
             if file_format == "parquet":
                 from rugo import parquet as rugo_parquet
