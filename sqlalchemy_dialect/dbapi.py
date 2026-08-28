@@ -126,89 +126,10 @@ class Cursor:
         self._opteryx_max_row_buffer: Optional[int] = None
         self._opteryx_result_format: str = "json"
 
-        # Try to authenticate using client credentials (client credentials flow)
-        # client_id is connection._username and client_secret is connection._token
-        try:
-            username = getattr(self._connection, "_username", None)
-            secret = getattr(self._connection, "_token", None)
-            if username and secret:
-                logger.debug("Attempting client credentials authentication for user: %s", username)
-                host = getattr(self._connection, "_host", "localhost")
-                # Normalize domain and build auth host (auth.domain)
-                try:
-                    domain = self._connection._normalize_domain(host)
-                except Exception as e:
-                    logger.debug("Failed to normalize domain '%s': %s", host, e)
-                    domain = host
-                # Only add auth. prefix when domain looks like a DNS name (not 'localhost')
-                if "." in domain and not domain.startswith("localhost"):
-                    auth_host = f"authenticate.{domain}"
-                else:
-                    auth_host = domain
-                scheme = "https" if getattr(self._connection, "_ssl", False) else "http"
-                auth_url = f"{scheme}://{auth_host}/token"
-                logger.debug("Authentication URL: %s", auth_url)
-
-                # Build form-encoded payload
-                payload = {
-                    "grant_type": "client_credentials",
-                    "client_id": username,
-                    "client_secret": secret,
-                }
-                # Use the connection session for auth so auth header set for all subsequent calls
-                sess = getattr(self._connection, "_session", requests.Session())
-                headers = {
-                    "accept": "application/json",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                }
-                resp = sess.post(
-                    auth_url,
-                    data=payload,
-                    headers=headers,
-                    timeout=getattr(self._connection, "_timeout", 30),
-                )
-                resp.raise_for_status()
-                body = resp.json() if resp.text else {}
-                token = body.get("access_token") or body.get("token") or body.get("jwt")
-                if token:
-                    self._jwt_token = token
-                    token_type = body.get("token_type", "bearer")
-                    # Capitalize token_type properly: "bearer" -> "Bearer"
-                    if token_type:
-                        token_type = (
-                            token_type[0].upper() + token_type[1:].lower()
-                            if len(token_type) > 0
-                            else "Bearer"
-                        )
-                    else:
-                        token_type = "Bearer"
-                    expires_in = body.get("expires_in")
-                    refresh_token = body.get("refresh_token")
-                    logger.info(
-                        "Authentication successful for user: %s (token_type=%s, expires_in=%s)",
-                        username,
-                        token_type,
-                        expires_in,
-                    )
-                    if refresh_token:
-                        logger.debug("Refresh token received for user: %s", username)
-                    # Set Authorization header for subsequent requests via the connection session
-                    try:
-                        auth_header = f"{token_type} {token}"
-                        self._connection._session.headers["Authorization"] = auth_header
-                        logger.debug("Set Authorization header to: %s ...", auth_header[:50])
-                    except Exception as e:
-                        logger.warning("Failed to set Authorization header: %s", e)
-                else:
-                    logger.warning("Authentication response missing token for user: %s", username)
-        except requests.exceptions.RequestException as e:
-            # Authentication failed — don't raise here; we will attempt queries without the JWT
-            logger.warning("Authentication failed for user %s: %s", username, e)
-            self._jwt_token = None
-        except Exception as e:
-            # Any unexpected failure in auth should not crash cursor creation
-            logger.error("Unexpected error during authentication: %s", e, exc_info=True)
-            self._jwt_token = None
+        # Authenticate via the connection, which caches the JWT so repeated
+        # cursor creation (one per statement under SQLAlchemy) does not pay
+        # an extra HTTP round trip per query.
+        self._jwt_token = self._connection._ensure_authenticated()
 
     @property
     def description(
@@ -311,7 +232,8 @@ class Cursor:
             return
 
         max_wait = 300  # Maximum wait time in seconds
-        poll_interval = 0.5  # Initial poll interval in seconds
+        poll_interval = 0.05  # Initial poll interval in seconds
+        start_time = time.monotonic()
         elapsed = 0.0
         last_log_time = 0.0  # Track when we last logged progress
         log_interval = 5.0  # Log progress every 5 seconds
@@ -320,6 +242,7 @@ class Cursor:
 
         while elapsed < max_wait:
             status = self._connection._get_statement_status(self._statement_handle)
+            elapsed = time.monotonic() - start_time
             raw_state = status.get("status")
 
             if isinstance(raw_state, dict):
@@ -343,7 +266,7 @@ class Cursor:
 
             if normalized_state in ("COMPLETED", "SUCCEEDED", "INCHOATE"):
                 logger.debug("Query execution completed with state: %s", normalized_state)
-                self._fetch_results()
+                self._fetch_results(status)
                 return
             if normalized_state in ("FAILED", "CANCELLED"):
                 error_message = (
@@ -358,8 +281,8 @@ class Cursor:
             if normalized_state in ("UNKNOWN", "SUBMITTED", "EXECUTING", "RUNNING"):
                 logger.debug("Query state: %s (elapsed: %.1fs)", normalized_state, elapsed)
                 time.sleep(poll_interval)
-                elapsed += poll_interval
                 poll_interval = min(poll_interval * 1.5, 2.5)
+                elapsed = time.monotonic() - start_time
                 continue
 
             logger.error("Unexpected statement state: %s", state_value)
@@ -390,12 +313,17 @@ class Cursor:
             for row_index in range(max_rows)
         ]
 
-    def _fetch_results(self) -> None:
-        """Fetch results from a completed statement."""
+    def _fetch_results(self, status_result: Optional[Dict[str, Any]] = None) -> None:
+        """Fetch results from a completed statement.
+
+        Args:
+            status_result: The final status payload from the poll loop, if
+                available; reusing it avoids a redundant status request.
+        """
         if not self._statement_handle:
             return
 
-        page_size = max(self._opteryx_max_row_buffer or 10, self._arraysize)
+        page_size = max(self._opteryx_max_row_buffer or 10_000, self._arraysize)
         offset = 0
         has_description = False
         rows: List[Tuple[Any, ...]] = []
@@ -454,7 +382,8 @@ class Cursor:
 
             return new_rows
 
-        status_result = self._connection._get_statement_status(self._statement_handle)  # pylint: disable=protected-access
+        if status_result is None:
+            status_result = self._connection._get_statement_status(self._statement_handle)  # pylint: disable=protected-access
         process_result_page(status_result)
         offset = len(rows)
 
@@ -548,7 +477,7 @@ class Connection:
 
     def __init__(
         self,
-        host: str = "jobs.opteryx.app",
+        host: str = "localhost",
         port: int = 8000,
         username: Optional[str] = None,
         token: Optional[str] = None,
@@ -575,6 +504,8 @@ class Connection:
         self._ssl = ssl
         self._timeout = timeout
         self._closed = False
+        self._jwt_token: Optional[str] = None
+        self._jwt_expires_at: Optional[float] = None  # time.monotonic() deadline
 
         # Build base URL
         scheme = "https" if ssl else "http"
@@ -626,6 +557,90 @@ class Connection:
         """Raise exception if connection is closed."""
         if self._closed:
             raise ProgrammingError("Connection is closed")
+
+    def _ensure_authenticated(self) -> Optional[str]:
+        """Authenticate via the client credentials flow, caching the JWT.
+
+        The token is fetched once and reused by every cursor until it nears
+        expiry (a 60 second safety margin is applied). Returns the current
+        JWT, or None when no credentials are configured or auth failed.
+        """
+        username = self._username
+        secret = self._token
+        if not (username and secret):
+            return None
+
+        if self._jwt_token is not None:
+            if self._jwt_expires_at is None or time.monotonic() < self._jwt_expires_at:
+                return self._jwt_token
+            logger.debug("Cached JWT near expiry; re-authenticating")
+
+        try:
+            logger.debug("Attempting client credentials authentication for user: %s", username)
+            # Normalize domain and build auth host (authenticate.domain)
+            try:
+                domain = self._normalize_domain(self._host)
+            except Exception as e:
+                logger.debug("Failed to normalize domain '%s': %s", self._host, e)
+                domain = self._host
+            # Only add auth. prefix when domain looks like a DNS name (not 'localhost')
+            if "." in domain and not domain.startswith("localhost"):
+                auth_host = f"authenticate.{domain}"
+            else:
+                auth_host = domain
+            scheme = "https" if self._ssl else "http"
+            auth_url = f"{scheme}://{auth_host}/token"
+            logger.debug("Authentication URL: %s", auth_url)
+
+            payload = {
+                "grant_type": "client_credentials",
+                "client_id": username,
+                "client_secret": secret,
+            }
+            headers = {
+                "accept": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded",
+            }
+            resp = self._session.post(auth_url, data=payload, headers=headers, timeout=self._timeout)
+            resp.raise_for_status()
+            body = resp.json() if resp.text else {}
+            token = body.get("access_token") or body.get("token") or body.get("jwt")
+            if not token:
+                logger.warning("Authentication response missing token for user: %s", username)
+                return None
+
+            token_type = body.get("token_type") or "Bearer"
+            # Capitalize token_type properly: "bearer" -> "Bearer"
+            token_type = token_type[0].upper() + token_type[1:].lower()
+            expires_in = body.get("expires_in")
+            logger.info(
+                "Authentication successful for user: %s (token_type=%s, expires_in=%s)",
+                username,
+                token_type,
+                expires_in,
+            )
+            if body.get("refresh_token"):
+                logger.debug("Refresh token received for user: %s", username)
+
+            self._jwt_token = token
+            try:
+                self._jwt_expires_at = time.monotonic() + max(float(expires_in) - 60.0, 0.0)
+            except (TypeError, ValueError):
+                self._jwt_expires_at = None  # No expiry info; keep token for connection lifetime
+
+            # Set Authorization header for subsequent requests via the session
+            auth_header = f"{token_type} {token}"
+            self._session.headers["Authorization"] = auth_header
+            logger.debug("Set Authorization header to: %s ...", auth_header[:50])
+            return token
+        except requests.exceptions.RequestException as e:
+            # Authentication failed — don't raise here; we will attempt queries without the JWT
+            logger.warning("Authentication failed for user %s: %s", username, e)
+            return None
+        except Exception as e:
+            # Any unexpected failure in auth should not crash cursor creation
+            logger.error("Unexpected error during authentication: %s", e, exc_info=True)
+            return None
 
     def _submit_statement(
         self, sql: str, parameters: Optional[Dict[str, Any]] = None
