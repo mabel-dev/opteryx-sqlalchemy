@@ -417,8 +417,9 @@ class TestCursor:
         second_get.status_code = 200
         second_get.text = '{"id": 3, "name": "c"}'
 
-        # The first call is the status poll, the next two are paginated results
-        mock_get.side_effect = [first_get, first_get, second_get]
+        # The first call is the status poll (whose payload is reused for the
+        # first page of rows), the second is the paginated download
+        mock_get.side_effect = [first_get, second_get]
 
         conn = dbapi.Connection()
         cursor = conn.cursor()
