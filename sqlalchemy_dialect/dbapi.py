@@ -351,7 +351,8 @@ class Cursor:
             return
 
         max_wait = 300  # Maximum wait time in seconds
-        poll_interval = 0.5  # Initial poll interval in seconds
+        poll_interval = 0.05  # Initial poll interval in seconds
+        start_time = time.monotonic()
         elapsed = 0.0
         last_log_time = 0.0  # Track when we last logged progress
         log_interval = 5.0  # Log progress every 5 seconds
@@ -360,6 +361,7 @@ class Cursor:
 
         while elapsed < max_wait:
             status = self._connection._get_statement_status(self._statement_handle)
+            elapsed = time.monotonic() - start_time
             raw_state = status.get("status")
 
             if isinstance(raw_state, dict):
@@ -383,7 +385,7 @@ class Cursor:
 
             if normalized_state in ("COMPLETED", "SUCCEEDED", "INCHOATE"):
                 logger.debug("Query execution completed with state: %s", normalized_state)
-                self._fetch_results()
+                self._fetch_results(status)
                 return
             if normalized_state in ("FAILED", "CANCELLED"):
                 error_message = (
@@ -398,8 +400,8 @@ class Cursor:
             if normalized_state in ("UNKNOWN", "SUBMITTED", "EXECUTING", "RUNNING"):
                 logger.debug("Query state: %s (elapsed: %.1fs)", normalized_state, elapsed)
                 time.sleep(poll_interval)
-                elapsed += poll_interval
                 poll_interval = min(poll_interval * 1.5, 2.5)
+                elapsed = time.monotonic() - start_time
                 continue
 
             logger.error("Unexpected statement state: %s", state_value)
@@ -430,12 +432,17 @@ class Cursor:
             for row_index in range(max_rows)
         ]
 
-    def _fetch_results(self) -> None:
-        """Fetch results from a completed statement."""
+    def _fetch_results(self, status_result: Optional[Dict[str, Any]] = None) -> None:
+        """Fetch results from a completed statement.
+
+        Args:
+            status_result: The final status payload from the poll loop, if
+                available; reusing it avoids a redundant status request.
+        """
         if not self._statement_handle:
             return
 
-        page_size = max(self._opteryx_max_row_buffer or 10, self._arraysize)
+        page_size = max(self._opteryx_max_row_buffer or 2_000, self._arraysize)
         offset = 0
         has_description = False
         rows: List[Tuple[Any, ...]] = []
@@ -494,7 +501,8 @@ class Cursor:
 
             return new_rows
 
-        status_result = self._connection._get_statement_status(self._statement_handle)  # pylint: disable=protected-access
+        if status_result is None:
+            status_result = self._connection._get_statement_status(self._statement_handle)  # pylint: disable=protected-access
         process_result_page(status_result)
         offset = len(rows)
 
