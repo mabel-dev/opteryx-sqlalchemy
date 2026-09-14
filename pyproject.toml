@@ -10,11 +10,11 @@ requires-python = ">=3.9"
 dependencies = [
     "brotli-asgi>=1.6.0",
     "python-jose[cryptography]>=3.3.0",
-    "cryptography>=50.0.0",
+    "cryptography>=50.0.1",
     "requests>=2.34.2",
     "python-multipart>=0.0.32",
     "sqlalchemy>=2.0.52",
-    "rugo>=0.4.31",
+    "rugo>=0.4.38",
 ]
 
 [project.entry-points."sqlalchemy.dialects"]
