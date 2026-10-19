@@ -13,8 +13,8 @@ dependencies = [
     "cryptography>=50.0.2",
     "requests>=2.34.2",
     "python-multipart>=0.0.32",
-    "sqlalchemy>=2.1.4",
-    "rugo>=0.5.2",
+    "sqlalchemy>=2.1.5",
+    "rugo>=0.5.4",
 ]
 
 [project.entry-points."sqlalchemy.dialects"]
