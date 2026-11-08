@@ -249,6 +249,9 @@ class Cursor:
         self._arraysize = 1
         self._closed = False
         self._statement_handle: Optional[str] = None
+        # Set by execute_async: the job is submitted but not yet waited on.
+        self._pending = False
+        self._submitted_at = 0.0
 
         # Execution option placeholders (may be set by dialect.do_execute)
         self._opteryx_execution_options: dict = {}
@@ -367,12 +370,23 @@ class Cursor:
         self,
     ) -> Optional[List[Tuple[str, Any, None, None, None, None, Optional[bool]]]]:
         """Column description as required by PEP 249."""
+        self._wait_if_pending()
         return self._description
 
     @property
     def rowcount(self) -> int:
         """Number of rows affected by the last operation."""
+        self._wait_if_pending()
         return self._rowcount
+
+    @property
+    def statement_handle(self) -> Optional[str]:
+        """The job ID of the last statement submitted, or None before one is.
+
+        It is set as soon as the job is created, so a statement started with
+        `execute_async` can be cancelled (see `cancel`) while it runs.
+        """
+        return self._statement_handle
 
     @property
     def arraysize(self) -> int:
@@ -408,11 +422,61 @@ class Cursor:
         Returns:
             Self for method chaining
         """
+        self._submit(operation, parameters)
+        self._wait()
+        return self
+
+    def execute_async(
+        self,
+        operation: str,
+        parameters: Optional[Union[Dict[str, Any], Sequence[Any]]] = None,
+    ) -> "Cursor":
+        """Submit a SQL statement and return once the job exists.
+
+        `statement_handle` is set when this returns. Reading `description`,
+        `rowcount` or any fetch method waits for the job to finish, exactly as
+        `execute` would have.
+        """
+        self._submit(operation, parameters)
+        self._pending = True
+        return self
+
+    def cancel(self, statement_handle: Optional[str] = None) -> bool:
+        """Ask the service to stop a running job.
+
+        Args:
+            statement_handle: The job to cancel; defaults to this cursor's
+                last statement. Cancelling from another cursor or connection
+                works as long as it authenticates as the client that
+                submitted the job.
+
+        Returns:
+            True if the service marked the job cancelled. A cursor waiting on
+            that job then raises OperationalError.
+        """
+        self._check_closed()
+        handle = statement_handle or self._statement_handle
+        if not handle:
+            return False
+        return self._connection._cancel_statement(handle)
+
+    def _wait_if_pending(self) -> None:
+        if self._pending:
+            self._pending = False
+            self._wait()
+
+    def _submit(
+        self,
+        operation: str,
+        parameters: Optional[Union[Dict[str, Any], Sequence[Any]]] = None,
+    ) -> None:
         self._check_closed()
         self._rows = []
         self._row_index = 0
         self._description = None
         self._rowcount = -1
+        self._statement_handle = None
+        self._pending = False
 
         # Log query (truncate if too long)
         query_preview = operation[:200] + "..." if len(operation) > 200 else operation
@@ -442,11 +506,13 @@ class Cursor:
             raise DatabaseError("No statement handle returned from server")
 
         logger.debug("Statement submitted with execution_id: %s", self._statement_handle)
+        self._submitted_at = start_time
 
-        # Poll for completion
+    def _wait(self) -> None:
+        """Poll the submitted statement to completion and load its results."""
         self._poll_for_results()
 
-        elapsed = time.time() - start_time
+        elapsed = time.time() - self._submitted_at
         logger.info("Query completed in %.2fs, returned %d rows", elapsed, self._rowcount)
 
         # Ensure description is not None so SQLAlchemy treats this as a rows-capable result.
@@ -454,8 +520,6 @@ class Cursor:
         # prevents SQLAlchemy from closing the result object immediately.
         if self._description is None:
             self._description = []
-
-        return self
 
     def _poll_for_results(self) -> None:
         """Poll the server until statement execution completes."""
@@ -499,7 +563,10 @@ class Cursor:
                 logger.debug("Query execution completed with state: %s", normalized_state)
                 self._fetch_results(status)
                 return
-            if normalized_state in ("FAILED", "CANCELLED"):
+            if normalized_state == "CANCELLED":
+                logger.info("Statement %s was cancelled", self._statement_handle)
+                raise OperationalError(f"Statement {self._statement_handle} was cancelled")
+            if normalized_state == "FAILED":
                 error_message = (
                     status.get("error_message")
                     or status_details.get("description")
@@ -664,6 +731,7 @@ class Cursor:
     def fetchone(self) -> Optional[Tuple[Any, ...]]:
         """Fetch the next row of a query result set."""
         self._check_closed()
+        self._wait_if_pending()
         if self._row_index >= len(self._rows):
             return None
         row = self._rows[self._row_index]
@@ -673,6 +741,7 @@ class Cursor:
     def fetchmany(self, size: Optional[int] = None) -> List[Tuple[Any, ...]]:
         """Fetch the next set of rows."""
         self._check_closed()
+        self._wait_if_pending()
         if size is None:
             size = self._arraysize
         rows = self._rows[self._row_index : self._row_index + size]
@@ -682,6 +751,7 @@ class Cursor:
     def fetchall(self) -> List[Tuple[Any, ...]]:
         """Fetch all remaining rows."""
         self._check_closed()
+        self._wait_if_pending()
         rows = self._rows[self._row_index :]
         self._row_index = len(self._rows)
         return rows
@@ -1005,6 +1075,35 @@ class Connection:
             raise DatabaseError(f"HTTP error: {e}") from e
         except requests.exceptions.RequestException as e:
             logger.error("Connection error submitting statement: %s", e)
+            raise OperationalError(f"Connection error: {e}") from e
+
+    def _cancel_statement(self, statement_handle: str) -> bool:
+        """Cancel a job; True if the service marked it CANCELLED."""
+        self._check_closed()
+
+        url = urljoin(self._data_base_url() + "/", f"api/v1/jobs/{statement_handle}/cancel")
+        logger.debug("Cancelling execution_id: %s", statement_handle)
+
+        try:
+            response = self._do_request_with_retry(
+                lambda: self._session.post(url, timeout=self._timeout)
+            )
+            return bool(response.json().get("cancelled"))
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None:
+                status_code = e.response.status_code
+                if status_code == 404:
+                    logger.info("Statement not found to cancel: %s", statement_handle)
+                    return False
+                try:
+                    detail = e.response.json().get("detail", str(e))
+                except (ValueError, json.JSONDecodeError):
+                    detail = e.response.text or str(e)
+                if status_code in (401, 403):
+                    raise OperationalError(f"Authentication error: {detail}") from e
+                raise DatabaseError(f"HTTP error: {detail}") from e
+            raise DatabaseError(f"HTTP error: {e}") from e
+        except requests.exceptions.RequestException as e:
             raise OperationalError(f"Connection error: {e}") from e
 
     def _get_statement_status(self, statement_handle: str) -> Dict[str, Any]:

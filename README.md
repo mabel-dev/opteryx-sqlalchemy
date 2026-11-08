@@ -192,6 +192,8 @@ opteryx://<client_id>:<client_secret>@opteryx.app:443/?ssl=true
 
 Schemas appear as `workspace.collection` and tables as the datasets in it. Superset needs an engine spec for Opteryx to offer time grains (day, week, month and so on) in charts; one is being contributed upstream to Apache Superset.
 
+`sqlalchemy_dialect.functions.FUNCTION_NAMES` lists the functions the engine accepts, for autocomplete without running a query. It is generated from opteryx-core's catalogs with `python scripts/generate_function_names.py <path-to-opteryx-core>`; regenerate it before each release.
+
 ---
 
 ## Behavior and Limitations ⚠️
@@ -205,6 +207,7 @@ Schemas appear as `workspace.collection` and tables as the datasets in it. Super
   - DECIMAL becomes a `decimal.Decimal`. The results API sends decimals as JSON numbers, so values with more than 15 significant digits may lose precision.
 - The `result_format` execution option picks how pages are fetched. `"json"` (the default) uses the typed `/results` pages. `"ndjson"` uses untyped rows from `/download`; values arrive as JSON delivers them, so timestamps are strings. `"parquet"` also uses `/download` and needs the `[parquet]` extra. If `/results` can't serve a job, the cursor falls back to `/download`.
 - If execution fails or times out, the DBAPI will raise an appropriate exception (subclass of DatabaseError/OperationalError).
+- `cursor.execute_async(sql)` submits a statement and returns once the job exists; `cursor.statement_handle` is then the job ID, and fetching (or reading `description`/`rowcount`) waits for the job as `execute` would. `cursor.cancel(job_id=None)` asks the service to stop a running job (the cursor's own by default) and returns whether it was cancelled; only the client that submitted a job can cancel it. A cursor waiting on a cancelled job raises `OperationalError`.
 
 ---
 
