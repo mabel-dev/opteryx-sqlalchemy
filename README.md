@@ -11,7 +11,7 @@ This project packages a SQLAlchemy dialect and lightweight DBAPI 2.0 adapter tha
 - Connect to Opteryx Cloud or self-hosted Opteryx instances with a SQLAlchemy connection URL and optional bearer token.
 - Read-only analytics with transparent polling of query status and incremental result streaming.
 - Lightweight DBAPI implementation that maps Opteryx types to SQLAlchemy while surfacing DatabaseError/OperationalError semantics.
-- Compatible with SQLAlchemy 2.x usage patterns, including context-managed engines and `text` queries.
+- Works with SQLAlchemy 1.4 and 2.x, including context-managed engines and `text` queries.
 - Schema introspection (`inspect(engine)`) — list schemas, tables, views, and columns (with types) without running SQL.
 - Work with pandas, dbt, or other tooling that understands SQLAlchemy engines.
 - **Comprehensive debug logging** for troubleshooting connection, authentication, and query execution issues.
@@ -52,6 +52,12 @@ Install the published package from PyPI in any environment:
 
 ```bash
 pip install opteryx-sqlalchemy
+```
+
+The opt-in `result_format="parquet"` execution option needs the `rugo` reader, which is an optional extra (wheels for CPython 3.11+ on Linux and macOS):
+
+```bash
+pip install "opteryx-sqlalchemy[parquet]"
 ```
 
 ---
@@ -153,7 +159,7 @@ with engine.connect() as conn:
     print(insp.get_table_names())
     # ['personal.myusername.customers', 'benchmarks.tpch.customer', ...]
 
-    # Views are listed separately from tables
+    # Views (including materialized views) are listed separately from tables
     print(insp.get_view_names(schema="personal.myusername"))
     # ['audits_as_at_seven_jan', 'cve_count_by_year', ...]
 
@@ -172,6 +178,20 @@ with engine.connect() as conn:
 
 Introspection is backed by Opteryx's OData metadata endpoints rather than SQL queries, so it doesn't cost a billed query execution. The first call that needs table schemas (`get_columns`, or `has_table`/`get_table_names` the first time) can take longer than a typical query — full metadata generation is a heavier server-side operation — but the result is cached for the lifetime of the connection, so repeated calls (e.g. reflecting many tables) don't re-pay that cost.
 
+The schema is the dataset's `workspace.collection` prefix. When SQLAlchemy renders a table it quotes each part of that prefix separately, so `table("planets", schema="public.astronomy")` compiles to `public.astronomy.planets`.
+
+---
+
+## Apache Superset
+
+Install the dialect into Superset's Python environment and add a database with this SQLAlchemy URI:
+
+```
+opteryx://<client_id>:<client_secret>@opteryx.app:443/?ssl=true
+```
+
+Schemas appear as `workspace.collection` and tables as the datasets in it. Superset needs an engine spec for Opteryx to offer time grains (day, week, month and so on) in charts; one is being contributed upstream to Apache Superset.
+
 ---
 
 ## Behavior and Limitations ⚠️
@@ -179,6 +199,11 @@ Introspection is backed by Opteryx's OData metadata endpoints rather than SQL qu
 - Opteryx is primarily an analytics engine — the dialect treats the service as read-only. Transactional features are effectively no-ops.
 - Schema introspection (`has_table`, `get_table_names`, `get_view_names`, `get_schema_names`, `get_columns`) is supported. Opteryx has no primary keys, foreign keys, or indexes, so `get_pk_constraint`/`get_foreign_keys`/`get_indexes` always return empty.
 - The dialect maps Opteryx native types to SQLAlchemy types as best-effort but does not implement a complete type mapping for every possible backend type.
+- Results are typed. Each `cursor.description` entry carries the engine's type name as its type code (`"TIMESTAMP[us]"`, `"DATE"`, `"DECIMAL(15, 2)"`, `"INT64"`, ...), and these compare equal to the PEP 249 `DATETIME`, `NUMBER`, `STRING` and `BINARY` objects. Values come back as Python types:
+  - TIMESTAMP becomes a timezone-aware `datetime` in UTC.
+  - DATE becomes a `date` and TIME a `time`.
+  - DECIMAL becomes a `decimal.Decimal`. The results API sends decimals as JSON numbers, so values with more than 15 significant digits may lose precision.
+- The `result_format` execution option picks how pages are fetched. `"json"` (the default) uses the typed `/results` pages. `"ndjson"` uses untyped rows from `/download`; values arrive as JSON delivers them, so timestamps are strings. `"parquet"` also uses `/download` and needs the `[parquet]` extra. If `/results` can't serve a job, the cursor falls back to `/download`.
 - If execution fails or times out, the DBAPI will raise an appropriate exception (subclass of DatabaseError/OperationalError).
 
 ---

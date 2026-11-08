@@ -4,18 +4,23 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opteryx-sqlalchemy"
-version = "0.0.10"
+version = "0.0.11"
 description = "Opteryx SQLAlchemy Dialect"
 requires-python = ">=3.9"
+# Keep these floors LOW: this is a library installed into other people's
+# environments (Apache Superset 6.x ships SQLAlchemy 1.4 and Python 3.10;
+# Superset master pins SQLAlchemy <2.1). Raising a floor to "latest" makes
+# the package uninstallable there. 1.4.24 is the first release with
+# `_ConnectionFairy.dbapi_connection`, which the dialect relies on.
 dependencies = [
-    "brotli-asgi>=1.7.0",
-    "python-jose[cryptography]>=3.3.0",
-    "cryptography>=50.0.2",
-    "requests>=2.34.2",
-    "python-multipart>=0.0.33",
-    "sqlalchemy>=2.1.8",
-    "rugo>=0.5.9",
+    "requests>=2.31",
+    "sqlalchemy>=1.4.24",
 ]
+
+[project.optional-dependencies]
+# Only needed for the opt-in `result_format="parquet"` execution option.
+# rugo publishes cp311+ manylinux_2_34 wheels only.
+parquet = ["rugo>=0.5.8"]
 
 [project.entry-points."sqlalchemy.dialects"]
 opteryx = "sqlalchemy_dialect.dialect:OpteryxDialect"
