@@ -411,14 +411,20 @@ class TestCursor:
             "total_rows": 3,
         }
 
-        # The second page comes from the /download endpoint, which returns NDJSON
-        # in `response.text` rather than a JSON body via `response.json()`.
+        # The second page comes from the /results endpoint: column by column,
+        # each column carrying its type.
         second_get = MagicMock()
         second_get.status_code = 200
-        second_get.text = '{"id": 3, "name": "c"}'
+        second_get.json.return_value = {
+            "total_rows": 3,
+            "data": [
+                {"name": "id", "type": "INT64", "values": [3]},
+                {"name": "name", "type": "VARCHAR", "values": ["c"]},
+            ],
+        }
 
         # The first call is the status poll (whose payload is reused for the
-        # first page of rows), the second is the paginated download
+        # first page of rows), the second is the paginated results page
         mock_get.side_effect = [first_get, second_get]
 
         conn = dbapi.Connection()
@@ -690,6 +696,156 @@ class TestCursor:
         conn.close()
 
 
+def _response(status_code=200, json_body=None, text=""):
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.json.return_value = json_body
+    resp.text = text
+    return resp
+
+
+_COMPLETED = {"execution_id": "h", "status": "COMPLETED"}
+
+
+class TestTypedResults:
+    """Result pages from /results carry column types; the cursor uses them."""
+
+    PAGE = {
+        "total_rows": 2,
+        "data": [
+            {
+                "name": "launched",
+                "type": "TIMESTAMP[us]",
+                "values": ["1957-10-04T19:28:00+00:00", None],
+            },
+            {"name": "day", "type": "DATE", "values": ["1996-01-02", "2024-02-29"]},
+            {"name": "price", "type": "DECIMAL(15, 2)", "values": [172799.49, 0.1]},
+            {"name": "ratio", "type": "FLOAT64", "values": [2.5, None]},
+            {"name": "n", "type": "INT64", "values": [1, 2]},
+            {"name": "company", "type": "VARCHAR", "values": ["RVSN USSR", "NASA"]},
+            {"name": "tags", "type": "ARRAY", "values": [["a", "b"], []]},
+        ],
+    }
+
+    @patch("requests.Session.post")
+    @patch("requests.Session.get")
+    def test_types_and_values(self, mock_get, mock_post):
+        import datetime
+        import decimal
+
+        mock_post.return_value = _response(json_body={"execution_id": "h"})
+        mock_get.side_effect = [_response(json_body=_COMPLETED), _response(json_body=self.PAGE)]
+
+        conn = dbapi.Connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1")
+
+        assert [d[0] for d in cursor.description] == [
+            "launched", "day", "price", "ratio", "n", "company", "tags"
+        ]  # fmt: skip
+        assert [d[1] for d in cursor.description] == [
+            "TIMESTAMP[us]", "DATE", "DECIMAL(15, 2)", "FLOAT64", "INT64", "VARCHAR", "ARRAY"
+        ]  # fmt: skip
+        assert cursor.description[0][1] == dbapi.DATETIME
+        assert cursor.description[2][1] == dbapi.NUMBER
+        assert cursor.description[5][1] == dbapi.STRING
+        assert cursor.description[5][1] != dbapi.DATETIME
+
+        first, second = cursor.fetchall()
+        assert first == (
+            datetime.datetime(1957, 10, 4, 19, 28, tzinfo=datetime.timezone.utc),
+            datetime.date(1996, 1, 2),
+            decimal.Decimal("172799.49"),
+            2.5,
+            1,
+            "RVSN USSR",
+            ["a", "b"],
+        )
+        assert second[0] is None
+        assert second[2] == decimal.Decimal("0.1")
+
+        # The page was requested from /results with num_rows inside the API's range.
+        url, kwargs = mock_get.call_args_list[1][0][0], mock_get.call_args_list[1][1]
+        assert url.endswith("/api/v1/jobs/h/results")
+        assert kwargs["params"] == {"num_rows": 10_000, "offset": 0}
+        conn.close()
+
+    @patch("requests.Session.post")
+    @patch("requests.Session.get")
+    def test_empty_result_keeps_columns(self, mock_get, mock_post):
+        """An empty result declares its columns without values: no phantom row."""
+        mock_post.return_value = _response(json_body={"execution_id": "h"})
+        empty = {"total_rows": 0, "data": [{"name": "id", "type": "INT64"}]}
+        mock_get.side_effect = [_response(json_body=_COMPLETED), _response(json_body=empty)]
+
+        conn = dbapi.Connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM t WHERE FALSE")
+        assert cursor.description == [("id", "INT64", None, None, None, None, None)]
+        assert cursor.fetchall() == []
+        conn.close()
+
+    @patch("requests.Session.post")
+    @patch("requests.Session.get")
+    def test_falls_back_to_download(self, mock_get, mock_post):
+        """If /results can't serve the job, rows come from /download as before (untyped)."""
+        import requests as _requests
+
+        mock_post.return_value = _response(json_body={"execution_id": "h"})
+        not_found = _response(status_code=404)
+        not_found.raise_for_status.side_effect = _requests.exceptions.HTTPError(
+            response=not_found
+        )
+        ndjson = _response(text='{"id": 1, "name": "a"}\n{"id": 2, "name": "b"}')
+        mock_get.side_effect = [_response(json_body=_COMPLETED), not_found, ndjson]
+
+        conn = dbapi.Connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name FROM t")
+        assert cursor.fetchall() == [(1, "a"), (2, "b")]
+        assert cursor.description[0] == ("id", None, None, None, None, None, None)
+        assert mock_get.call_args_list[2][0][0].endswith("/api/v1/jobs/h/download")
+        conn.close()
+
+    @patch("requests.Session.post")
+    @patch("requests.Session.get")
+    def test_ndjson_format_uses_download(self, mock_get, mock_post):
+        mock_post.return_value = _response(json_body={"execution_id": "h"})
+        ndjson = _response(text='{"id": 1}')
+        mock_get.side_effect = [_response(json_body=_COMPLETED), ndjson]
+
+        conn = dbapi.Connection()
+        cursor = conn.cursor()
+        cursor._opteryx_result_format = "ndjson"
+        cursor.execute("SELECT id FROM t")
+        assert cursor.fetchall() == [(1,)]
+        url, kwargs = mock_get.call_args_list[1][0][0], mock_get.call_args_list[1][1]
+        assert url.endswith("/download")
+        assert kwargs["params"]["file_format"] == "json"
+        conn.close()
+
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            ("2024-01-02T03:04:05+00:00", (2024, 1, 2, 3, 4, 5, 0)),
+            ("2024-01-02T03:04:05.123456+00:00", (2024, 1, 2, 3, 4, 5, 123456)),
+            ("2024-01-02T03:04:05.123+00:00", (2024, 1, 2, 3, 4, 5, 123000)),
+            ("2024-01-02T03:04:05.123456789+00:00", (2024, 1, 2, 3, 4, 5, 123456)),
+            ("2024-01-02T03:04:05Z", (2024, 1, 2, 3, 4, 5, 0)),
+        ],
+    )
+    def test_timestamp_parsing(self, text, expected):
+        import datetime
+
+        value = dbapi._to_timestamp(text)
+        assert value == datetime.datetime(*expected, tzinfo=datetime.timezone.utc)
+
+    def test_unparseable_values_pass_through(self):
+        assert dbapi._to_timestamp("not a timestamp") == "not a timestamp"
+        assert dbapi._to_date("nope") == "nope"
+        assert dbapi._to_decimal(True) is True
+
+
 class TestDialect:
     """Tests for the SQLAlchemy dialect."""
 
@@ -747,6 +903,37 @@ class TestDialect:
         dialect = OpteryxDialect()
         assert dialect.get_isolation_level(None) == "AUTOCOMMIT"
 
+    def test_create_connect_args_port_443_implies_ssl(self):
+        """Port 443 without an ssl query parameter means HTTPS."""
+        from sqlalchemy.engine.url import make_url
+
+        dialect = OpteryxDialect()
+        _, kwargs = dialect.create_connect_args(make_url("opteryx://id:secret@opteryx.app:443/"))
+        assert kwargs["ssl"] is True
+
+    def test_create_connect_args_explicit_ssl_false_wins(self):
+        """An explicit ssl=false is respected even on port 443."""
+        from sqlalchemy.engine.url import make_url
+
+        dialect = OpteryxDialect()
+        _, kwargs = dialect.create_connect_args(make_url("opteryx://localhost:443/?ssl=false"))
+        assert kwargs["ssl"] is False
+
+    def test_dotted_schema_is_quoted_per_part(self):
+        """A workspace.collection schema renders as dotted parts, not one quoted name."""
+        from sqlalchemy import column
+        from sqlalchemy import select
+        from sqlalchemy import table
+
+        dialect = OpteryxDialect()
+        plain = table("countries", column("iso_alpha2"), schema="demo.geopolitics")
+        sql = str(select(plain.c.iso_alpha2).compile(dialect=dialect))
+        assert "FROM demo.geopolitics.countries" in sql
+
+        mixed = table("Planets", column("Name"), schema="demo.Space Data")
+        sql = str(select(mixed.c.Name).compile(dialect=dialect))
+        assert 'FROM demo."Space Data"."Planets"' in sql
+
 
 class TestIntrospection:
     """Tests for OData-backed schema introspection (has_table, get_columns, etc)."""
@@ -755,8 +942,33 @@ class TestIntrospection:
         {"name": "public.examples.planets", "kind": "EntitySet", "source": "Table"},
         {"name": "public.examples.moons", "kind": "EntitySet", "source": "Table"},
         {"name": "public.examples.a_view", "kind": "EntitySet", "source": "View"},
+        {"name": "public.examples.an_mv", "kind": "EntitySet", "source": "MaterializedView"},
         {"name": "personal.bastian.customers", "kind": "EntitySet", "source": "Table"},
     ]
+
+    def test_get_view_names_includes_materialized_views(self):
+        """Materialized views are listed as views (they'd otherwise be invisible)."""
+        sa_connection, _ = self._fake_sa_connection(self.SERVICE_DOCUMENT)
+        dialect = OpteryxDialect()
+        assert dialect.get_view_names(sa_connection, schema="public.examples") == [
+            "a_view",
+            "an_mv",
+        ]
+        assert dialect.get_materialized_view_names(sa_connection, schema="public.examples") == [
+            "an_mv"
+        ]
+        assert "an_mv" not in dialect.get_table_names(sa_connection, schema="public.examples")
+
+    def test_schema_scope_is_exact(self):
+        """A schema matches its own datasets only, not those of a longer dotted prefix."""
+        document = [
+            {"name": "ws.coll", "kind": "EntitySet", "source": "Table"},
+            {"name": "ws.coll.ds", "kind": "EntitySet", "source": "Table"},
+        ]
+        sa_connection, _ = self._fake_sa_connection(document)
+        dialect = OpteryxDialect()
+        assert dialect.get_table_names(sa_connection, schema="ws") == ["coll"]
+        assert dialect.get_table_names(sa_connection, schema="ws.coll") == ["ds"]
 
     METADATA = {
         "public_examples_planets": [
@@ -834,11 +1046,11 @@ class TestIntrospection:
         assert tables == ["public.examples.planets", "public.examples.moons", "personal.bastian.customers"]
 
     def test_get_view_names(self):
-        """Test get_view_names only returns entities with source == 'View'."""
+        """Test get_view_names returns views and materialized views, never tables."""
         sa_connection, _ = self._fake_sa_connection(self.SERVICE_DOCUMENT)
         dialect = OpteryxDialect()
         views = dialect.get_view_names(sa_connection, schema="public.examples")
-        assert views == ["a_view"]
+        assert views == ["a_view", "an_mv"]
 
     def test_get_schema_names(self):
         """Test get_schema_names derives distinct dotted prefixes."""

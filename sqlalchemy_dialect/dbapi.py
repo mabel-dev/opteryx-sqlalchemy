@@ -8,8 +8,11 @@ classes that translate SQL queries into HTTP requests.
 
 from __future__ import annotations
 
+import datetime
+import decimal
 import json
 import logging
+import re
 import time
 from importlib.metadata import version
 from typing import Any
@@ -38,6 +41,11 @@ paramstyle = "named"  # Named style: WHERE name=:name
 # Refresh the client-credentials token this many seconds before its reported
 # expiry, so an in-flight request doesn't race against the token expiring.
 _TOKEN_EXPIRY_SKEW_SECONDS = 30.0
+
+# Rows requested per results page. The results API accepts 100..10000.
+_DEFAULT_PAGE_ROWS = 10_000
+_MIN_RESULTS_PAGE = 100
+_MAX_RESULTS_PAGE = 10_000
 
 
 class Error(Exception):
@@ -101,11 +109,115 @@ def Binary(string: bytes) -> bytes:
     return string
 
 
-STRING = str
-BINARY = bytes
-NUMBER = float
-DATETIME = str
-ROWID = str
+def _base_type_name(type_name: Any) -> str:
+    """The type name without its detail: "TIMESTAMP[us]" -> "TIMESTAMP", "DECIMAL(15, 2)" -> "DECIMAL"."""
+    if not isinstance(type_name, str):
+        return ""
+    return re.split(r"[\[(]", type_name, maxsplit=1)[0].strip().upper()
+
+
+class DBAPITypeObject:
+    """PEP 249 type object: compares equal to any type code in its group.
+
+    Type codes in `Cursor.description` are the engine's SQL type names as the
+    results API reports them (e.g. "TIMESTAMP[us]", "DECIMAL(15, 2)", "INT64").
+    """
+
+    def __init__(self, *names: str) -> None:
+        self.names = frozenset(names)
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, DBAPITypeObject):
+            return self.names == other.names
+        return _base_type_name(other) in self.names
+
+    def __ne__(self, other: Any) -> bool:
+        return not self.__eq__(other)
+
+    def __hash__(self) -> int:
+        return hash(self.names)
+
+
+STRING = DBAPITypeObject("VARCHAR", "NVARCHAR", "STRING", "IPV4")
+BINARY = DBAPITypeObject("VARBINARY", "BLOB", "BINARY")
+NUMBER = DBAPITypeObject(
+    "INT8", "INT16", "INT32", "INT64", "UINT8", "UINT16", "UINT32", "UINT64",
+    "FLOAT32", "FLOAT64", "DECIMAL", "BOOL",
+)  # fmt: skip
+DATETIME = DBAPITypeObject("TIMESTAMP", "DATE", "TIME")
+ROWID = DBAPITypeObject()
+
+
+# fromisoformat() before Python 3.11 accepts exactly 3 or 6 fractional digits
+# and no "Z"; the engine can emit up to 9 (nanosecond timestamps).
+_FRACTION = re.compile(r"\.(\d+)")
+
+
+def _normalise_iso(text: str) -> str:
+    text = text.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    match = _FRACTION.search(text)
+    if match:
+        digits = (match.group(1) + "000000")[:6]
+        text = f"{text[: match.start()]}.{digits}{text[match.end() :]}"
+    return text
+
+
+def _to_timestamp(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    try:
+        return datetime.datetime.fromisoformat(_normalise_iso(value))
+    except ValueError:
+        return value
+
+
+def _to_date(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    try:
+        return datetime.date.fromisoformat(value.strip()[:10])
+    except ValueError:
+        return value
+
+
+def _to_time(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    try:
+        return datetime.time.fromisoformat(_normalise_iso(value))
+    except ValueError:
+        return value
+
+
+def _to_decimal(value: Any) -> Any:
+    # JSON carries decimals as numbers; repr() of the parsed float is the
+    # shortest string that round-trips, so values with up to 15 significant
+    # digits come back exactly as the server wrote them.
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, float):
+        return decimal.Decimal(repr(value))
+    if isinstance(value, (int, str)):
+        try:
+            return decimal.Decimal(value)
+        except decimal.InvalidOperation:
+            return value
+    return value
+
+
+_VALUE_CONVERTERS = {
+    "TIMESTAMP": _to_timestamp,
+    "DATE": _to_date,
+    "TIME": _to_time,
+    "DECIMAL": _to_decimal,
+}
+
+
+def _converter_for(type_name: Any):
+    """Python-value converter for a results-API type name, or None if JSON already fits."""
+    return _VALUE_CONVERTERS.get(_base_type_name(type_name))
 
 
 def _redact_secret(value: Optional[str], visible: int = 4) -> str:
@@ -442,11 +554,19 @@ class Cursor:
         if not self._statement_handle:
             return
 
-        page_size = max(self._opteryx_max_row_buffer or 2_000, self._arraysize)
+        page_size = max(self._opteryx_max_row_buffer or _DEFAULT_PAGE_ROWS, self._arraysize)
         offset = 0
         has_description = False
         rows: List[Tuple[Any, ...]] = []
         total_rows: Optional[int] = None
+
+        def describe(columns: Sequence[Dict[str, Any]]) -> None:
+            # type_code is the engine's SQL type name ("TIMESTAMP[us]", "INT64",
+            # ...) when the payload carries one, None otherwise (NDJSON, parquet).
+            self._description = [
+                (col.get("name", f"col{i}"), col.get("type"), None, None, None, None, None)
+                for i, col in enumerate(columns)
+            ]
 
         def process_result_page(result: Dict[str, Any]) -> int:
             nonlocal has_description, total_rows
@@ -459,22 +579,23 @@ class Cursor:
 
             columns_meta = result.get("columns", [])
             if columns_meta and not has_description:
-                self._description = [
-                    (col.get("name", f"col{i}"), None, None, None, None, None, None)
-                    for i, col in enumerate(columns_meta)
-                ]
+                describe(columns_meta)
                 has_description = True
 
             data = result.get("data", [])
             if data:
                 if isinstance(data[0], dict) and "values" in data[0]:
-                    # Columnar format: each dict has {name: ..., values: [...]}
+                    # Columnar format: each dict has {name, type, values: [...]}
                     if not has_description:
-                        self._description = [
-                            (col.get("name", f"col{i}"), None, None, None, None, None, None)
-                            for i, col in enumerate(data)
-                        ]
+                        describe(data)
                         has_description = True
+                    data = [
+                        dict(col, values=[convert(v) for v in col.get("values") or []])
+                        if (convert := _converter_for(col.get("type")))
+                        else col
+                        for col in data
+                        if isinstance(col, dict)
+                    ]
                     column_rows = self._rows_from_columnar_data(data)
                     rows.extend(column_rows)
                     new_rows = len(column_rows)
@@ -929,6 +1050,70 @@ class Connection:
             logger.error("Connection error checking status: %s", e)
             raise OperationalError(f"Connection error: {e}") from e
 
+    def _get_typed_results(
+        self,
+        statement_handle: str,
+        num_rows: Optional[int] = None,
+        offset: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Get one page of results from the /results endpoint, with column types.
+
+        The endpoint returns the page column by column, each column carrying its
+        SQL type name ({"name", "type", "values"}), which is what lets the cursor
+        report type codes and return datetime/date/Decimal values instead of the
+        strings JSON carries them as.
+
+        Returns:
+            {"columns": [{"name", "type"}], "data": [<columnar>], "total_rows": n},
+            or None when the endpoint can't serve this job (the caller then falls
+            back to /download). Authentication failures raise OperationalError.
+        """
+        url = urljoin(self._data_base_url() + "/", f"api/v1/jobs/{statement_handle}/results")
+        requested = _DEFAULT_PAGE_ROWS if num_rows is None else int(num_rows)
+        params = {
+            "num_rows": min(max(requested, _MIN_RESULTS_PAGE), _MAX_RESULTS_PAGE),
+            "offset": int(offset or 0),
+        }
+        logger.debug(
+            "Fetching typed results for execution_id: %s (num_rows=%s, offset=%s)",
+            statement_handle,
+            params["num_rows"],
+            params["offset"],
+        )
+        try:
+            response = self._do_request_with_retry(
+                lambda: self._session.get(url, params=params, timeout=self._timeout)
+            )
+            if response.status_code != 200:
+                # 202 means "not finished"; the poll loop only gets here once the
+                # job is COMPLETED, so treat anything else as "use /download".
+                logger.debug("Results endpoint returned HTTP %s", response.status_code)
+                return None
+            payload = response.json()
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code in (401, 403):
+                try:
+                    detail = e.response.json().get("detail", str(e))
+                except (ValueError, json.JSONDecodeError):
+                    detail = e.response.text or str(e)
+                raise OperationalError(f"Authentication error: {detail}") from e
+            logger.debug("Results endpoint unavailable (%s), falling back to /download", e)
+            return None
+        except (requests.exceptions.RequestException, ValueError) as e:
+            logger.debug("Error fetching typed results: %s, falling back to /download", e)
+            return None
+
+        columns = [col for col in (payload.get("data") or []) if isinstance(col, dict)]
+        result: Dict[str, Any] = {
+            "columns": [{"name": col.get("name"), "type": col.get("type")} for col in columns],
+            # A page past the end (or an empty result) declares its columns
+            # without a values array; keep the columns, report no rows.
+            "data": columns if any("values" in col for col in columns) else [],
+        }
+        if "total_rows" in payload:
+            result["total_rows"] = payload["total_rows"]
+        return result
+
     def _get_statement_results(
         self,
         statement_handle: str,
@@ -936,19 +1121,26 @@ class Connection:
         offset: Optional[int] = None,
         file_format: str = "json",
     ) -> Dict[str, Any]:
-        """Get results for a completed statement using the /download endpoint.
+        """Get one page of results for a completed statement.
 
         Args:
             statement_handle: The execution ID returned by submit
-            num_rows: Maximum number of rows to return (maps to 'limit' param)
+            num_rows: Maximum number of rows to return
             offset: Row offset for pagination
-            file_format: "json" (NDJSON, default) or "parquet"
+            file_format: "json" (default: typed, column-by-column pages from
+                /results), "ndjson" (untyped rows from /download) or "parquet"
+                (/download as Parquet, needs the optional rugo dependency)
 
         Returns:
             Dictionary containing the result data in a format compatible with process_result_page.
-            The download endpoint returns NDJSON (newline-delimited JSON) or Parquet bytes,
-            depending on file_format; both are normalised to the same row-dict shape here.
         """
+        if file_format == "json":
+            typed = self._get_typed_results(statement_handle, num_rows=num_rows, offset=offset)
+            if typed is not None:
+                return typed
+        if file_format == "ndjson":
+            file_format = "json"
+
         url = urljoin(self._data_base_url() + "/", f"api/v1/jobs/{statement_handle}/download")
         params: Dict[str, Any] = {"file_format": file_format}
         if num_rows is not None:
@@ -970,7 +1162,13 @@ class Connection:
             )
 
             if file_format == "parquet":
-                from rugo import parquet as rugo_parquet
+                try:
+                    from rugo import parquet as rugo_parquet
+                except ImportError as e:
+                    raise NotSupportedError(
+                        'result_format="parquet" needs the optional rugo dependency: '
+                        "pip install 'opteryx-sqlalchemy[parquet]'"
+                    ) from e
 
                 rows = []
                 columns: Optional[List[str]] = None

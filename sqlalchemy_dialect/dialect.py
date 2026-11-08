@@ -25,10 +25,30 @@ from sqlalchemy import types as sqltypes
 from sqlalchemy.engine import default
 from sqlalchemy.engine.interfaces import ExecutionContext
 from sqlalchemy.engine.url import URL
+from sqlalchemy.sql import compiler
 
 from . import dbapi
 
 logger = logging.getLogger("sqlalchemy.dialects.opteryx")
+
+# OData `source` values listed as tables vs views. Materialized views are
+# reported as views: they are read like one and can't be written to.
+_TABLE_SOURCES = frozenset({"Table"})
+_VIEW_SOURCES = frozenset({"View", "MaterializedView"})
+
+
+class OpteryxIdentifierPreparer(compiler.IdentifierPreparer):
+    """Quote each part of a dotted schema name separately.
+
+    Opteryx datasets are addressed as ``workspace.collection.dataset`` and the
+    dialect reports ``workspace.collection`` as the schema. The default
+    preparer quotes that as one identifier (``"demo.geopolitics"``); quoting
+    part by part renders the name users write (``demo.geopolitics.countries``)
+    and only quotes a part that needs it.
+    """
+
+    def quote_schema(self, schema: str, force: Any = None) -> str:
+        return ".".join(self.quote(part) for part in schema.split("."))
 
 
 _EDM_TYPE_MAP = {
@@ -91,6 +111,8 @@ class OpteryxDialect(default.DefaultDialect):
 
     name = "opteryx"
     driver = "http"
+
+    preparer = OpteryxIdentifierPreparer
 
     # Capabilities
     supports_alter = False
@@ -200,6 +222,11 @@ class OpteryxDialect(default.DefaultDialect):
                     opts["timeout"] = float(query["timeout"])
                 except ValueError:
                     pass
+
+        # Port 443 means HTTPS unless the URL explicitly says otherwise, so
+        # `opteryx://id:secret@opteryx.app:443/` works without `?ssl=true`.
+        if "ssl" not in opts and opts.get("port") == 443:
+            opts["ssl"] = True
 
         return ([], opts)
 
@@ -334,36 +361,45 @@ class OpteryxDialect(default.DefaultDialect):
         """
         return []
 
-    def _get_entity_names(self, connection: Any, schema: Optional[str], source: str) -> list:
-        """Shared helper: entity names of a given OData `source` ("Table" or "View").
+    def _get_entity_names(
+        self, connection: Any, schema: Optional[str], sources: frozenset
+    ) -> list:
+        """Shared helper: entity names whose OData `source` is one of `sources`.
 
-        If `schema` is given, names are scoped to that dotted prefix and
-        returned with the prefix stripped; otherwise the full dotted name is
-        returned (Opteryx datasets are commonly addressed in dotted form,
-        e.g. "public.examples.planets").
+        If `schema` is given, names are scoped to exactly that dotted prefix
+        (the entity's name minus its last part, as `get_schema_names` reports
+        it) and returned with the prefix stripped; otherwise the full dotted
+        name is returned (Opteryx datasets are commonly addressed in dotted
+        form, e.g. "public.examples.planets").
         """
         entities = _dbapi_connection(connection).get_odata_service_document()
-        prefix = f"{schema}." if schema else None
         names = []
         for entity in entities:
-            if entity.get("kind") != "EntitySet" or entity.get("source") != source:
+            if entity.get("kind") != "EntitySet" or entity.get("source") not in sources:
                 continue
             full_name = entity.get("name", "")
-            if prefix:
-                if not full_name.startswith(prefix):
+            if schema:
+                entity_schema, _, entity_name = full_name.rpartition(".")
+                if entity_schema != schema:
                     continue
-                names.append(full_name[len(prefix) :])
+                names.append(entity_name)
             else:
                 names.append(full_name)
         return names
 
     def get_table_names(self, connection: Any, schema: Optional[str] = None, **kw: Any) -> list:
         """Get list of table names from the OData service document."""
-        return self._get_entity_names(connection, schema, "Table")
+        return self._get_entity_names(connection, schema, _TABLE_SOURCES)
 
     def get_view_names(self, connection: Any, schema: Optional[str] = None, **kw: Any) -> list:
-        """Get list of view names from the OData service document."""
-        return self._get_entity_names(connection, schema, "View")
+        """Get list of view names (including materialized views) from the OData service document."""
+        return self._get_entity_names(connection, schema, _VIEW_SOURCES)
+
+    def get_materialized_view_names(
+        self, connection: Any, schema: Optional[str] = None, **kw: Any
+    ) -> list:
+        """Get list of materialized view names (SQLAlchemy 2.0+ inspector API)."""
+        return self._get_entity_names(connection, schema, frozenset({"MaterializedView"}))
 
     def get_schema_names(self, connection: Any, **kw: Any) -> list:
         """Get list of schema names, derived from the dotted prefixes of known entities."""
