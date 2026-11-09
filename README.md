@@ -42,9 +42,9 @@ Notes:
 
 ### 1. Create an Opteryx Account
 
-If you don't have an Opteryx account yet, register at: **https://opteryx.app/auth/register.html**
+Sign in (or create an account) at: **https://opteryx.app/login.html**
 
-Once registered, you'll receive credentials (username and token) needed to authenticate.
+Once signed in, you'll receive credentials (username and token) needed to authenticate.
 
 ### 2. Install the Package
 
@@ -62,7 +62,7 @@ pip install "opteryx-sqlalchemy[parquet]"
 
 ---
 
-See [`notebooks/quickstart.ipynb`](notebooks/quickstart.ipynb) for a runnable walkthrough covering all of the below (connecting, queries, pandas, execution options, and introspection) in one notebook.
+See the [quickstart notebook](https://colab.research.google.com/github/mabel-dev/docs.opteryx.app/blob/main/docs-site/public/notebooks/query-opteryx-app-with-sqlalchemy.ipynb) for a runnable walkthrough covering all of the below (connecting, queries, pandas, execution options, and introspection) in one notebook — opens directly in Google Colab, no install required.
 
 ## Quickstart — SQLAlchemy Core / Engine
 
@@ -207,7 +207,7 @@ Schemas appear as `workspace.collection` and tables as the datasets in it. Super
   - DECIMAL becomes a `decimal.Decimal`. The results API sends decimals as JSON numbers, so values with more than 15 significant digits may lose precision.
 - The `result_format` execution option picks how pages are fetched. `"json"` (the default) uses the typed `/results` pages. `"ndjson"` uses untyped rows from `/download`; values arrive as JSON delivers them, so timestamps are strings. `"parquet"` also uses `/download` and needs the `[parquet]` extra. If `/results` can't serve a job, the cursor falls back to `/download`.
 - If execution fails or times out, the DBAPI will raise an appropriate exception (subclass of DatabaseError/OperationalError).
-- `cursor.execute_async(sql)` submits a statement and returns once the job exists; `cursor.statement_handle` is then the job ID, and fetching (or reading `description`/`rowcount`) waits for the job as `execute` would. `cursor.cancel(job_id=None)` asks the service to stop a running job (the cursor's own by default) and returns whether it was cancelled; only the client that submitted a job can cancel it. A cursor waiting on a cancelled job raises `OperationalError`.
+- `cursor.execute_async(sql)` submits a statement and returns once the job exists; `cursor.statement_handle` is then the job ID, and fetching (or reading `description`/`rowcount`) waits for the job as `execute` would. `cursor.cancel(statement_handle=None)` asks the service to stop a running job (the cursor's own by default) and returns whether it was cancelled; only the client that submitted a job can cancel it. A cursor waiting on a cancelled job raises `OperationalError`.
 
 ---
 

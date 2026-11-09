@@ -5,18 +5,27 @@ on: push
 jobs:
   regression:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14", "3.15"]
+        # Floor from pyproject, latest 1.4 (Superset 6.x), latest 2.0 (Superset master pins <2.1), latest.
+        sqlalchemy: ["==1.4.24", "~=1.4.0", "~=2.0.0", ""]
+
+    name: py${{ matrix.python-version }} sqlalchemy${{ matrix.sqlalchemy || ' latest' }}
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.14"
+          python-version: ${{ matrix.python-version }}
 
       - name: install dependencies
         run: |
-          python -m pip install -U pip pytest pandas
-          pip install -e .
+          python -m pip install -U pip
+          pip install pytest pandas -e . "sqlalchemy${{ matrix.sqlalchemy }}"
+          python -c "import sqlalchemy; print('SQLAlchemy', sqlalchemy.__version__)"
 
       - name: run regression tests
         run: python -m pytest -q tests
