@@ -102,6 +102,19 @@ def _quote_identifier(identifier: str) -> str:
     return f'"{identifier}"'
 
 
+class OpteryxExecutionContext(default.DefaultExecutionContext):
+    def create_server_side_cursor(self) -> Any:
+        """A cursor that reads result pages as rows are fetched.
+
+        SQLAlchemy asks for one when `stream_results` or `yield_per` is set.
+        Opteryx results stay on the server and are already paged, so streaming
+        is the same cursor reading one page at a time.
+        """
+        cursor = self.create_default_cursor()
+        cursor._opteryx_stream_results_requested = True
+        return cursor
+
+
 class OpteryxDialect(default.DefaultDialect):
     """SQLAlchemy dialect for Opteryx data service.
 
@@ -113,6 +126,10 @@ class OpteryxDialect(default.DefaultDialect):
     driver = "http"
 
     preparer = OpteryxIdentifierPreparer
+    execution_ctx_cls = OpteryxExecutionContext
+
+    # stream_results / yield_per read results a page at a time.
+    supports_server_side_cursors = True
 
     # Capabilities
     supports_alter = False
@@ -239,8 +256,14 @@ class OpteryxDialect(default.DefaultDialect):
     ) -> Any:
         """Propagate execution options so downstream code can react to them."""
         execution_options = getattr(context, "execution_options", {}) if context is not None else {}
-        streaming_requested = bool(execution_options.get("stream_results"))
-        max_row_buffer = execution_options.get("max_row_buffer")
+        # A server-side cursor (see OpteryxExecutionContext) is already marked.
+        streaming_requested = bool(execution_options.get("stream_results")) or bool(
+            getattr(cursor, "_opteryx_stream_results_requested", False)
+        )
+        # The page size: max_row_buffer if given, else the yield_per batch size.
+        max_row_buffer = execution_options.get("max_row_buffer") or execution_options.get(
+            "yield_per"
+        )
         result_format = execution_options.get("result_format", "json")
 
         # Attach the parsed streaming hints to the DBAPI cursor for later use.
@@ -331,7 +354,8 @@ class OpteryxDialect(default.DefaultDialect):
     ) -> dict:
         """Get primary key constraint.
 
-        Opteryx doesn't have primary keys in the traditional sense.
+        Opteryx has no primary keys. The <Key> in $metadata is always the first
+        column, only because OData requires a key, so it is deliberately ignored.
         """
         return {"constrained_columns": [], "name": None}
 
@@ -344,9 +368,13 @@ class OpteryxDialect(default.DefaultDialect):
     ) -> list:
         """Get foreign key information.
 
-        Opteryx doesn't support foreign keys.
+        Opteryx foreign keys are declared, not enforced. They come from the OData
+        $metadata document, which only lists ones whose referred table this
+        caller can see.
         """
-        return []
+        full_name = f"{schema}.{table_name}" if schema else table_name
+        foreign_keys = _dbapi_connection(connection).get_odata_foreign_keys()
+        return [dict(fk) for fk in foreign_keys.get(full_name, [])]
 
     def get_indexes(
         self,
