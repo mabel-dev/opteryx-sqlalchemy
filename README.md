@@ -2,18 +2,18 @@
 
 SQLAlchemy dialect for Opteryx Cloud (https://opteryx.app) — use On Demand Opteryx wherever SQLAlchemy is supported.
 
-This project packages a SQLAlchemy dialect and lightweight DBAPI 2.0 adapter that talk to Opteryx's HTTP API, enabling read-only SQL access to Opteryx Cloud from SQLAlchemy Core, engines, and downstream tools like pandas and dbt. The library is published on PyPI as `opteryx-sqlalchemy`, so you can `pip install opteryx-sqlalchemy` in any environment.
+This project packages a SQLAlchemy dialect and lightweight DBAPI 2.0 adapter that talk to Opteryx's HTTP API, enabling read-only SQL access to Opteryx Cloud from SQLAlchemy Core, engines, and downstream tools like pandas. The library is published on PyPI as `opteryx-sqlalchemy`, so you can `pip install opteryx-sqlalchemy` in any environment.
 
 ---
 
 ## Features ✅
 
 - Connect to Opteryx Cloud or self-hosted Opteryx instances with a SQLAlchemy connection URL and optional bearer token.
-- Read-only analytics with transparent polling of query status and incremental result streaming.
+- Read-only analytics with transparent polling of query status and paged result fetching.
 - Lightweight DBAPI implementation that maps Opteryx types to SQLAlchemy while surfacing DatabaseError/OperationalError semantics.
 - Works with SQLAlchemy 1.4 and 2.x, including context-managed engines and `text` queries.
 - Schema introspection (`inspect(engine)`) — list schemas, tables, views, and columns (with types) without running SQL.
-- Work with pandas, dbt, or other tooling that understands SQLAlchemy engines.
+- Work with pandas or other tooling that understands SQLAlchemy engines.
 - **Comprehensive debug logging** for troubleshooting connection, authentication, and query execution issues.
 - Install from PyPI (`pip install opteryx-sqlalchemy`) or lock into editable mode for development.
 
@@ -88,7 +88,12 @@ with engine.connect() as conn:
 - Replace `mytoken` with your Opteryx authentication token
 - For Opteryx Cloud, always use `opteryx.app:443` with `ssl=true`
 
-> **Note on bound parameters:** the Opteryx Cloud API accepts a `parameters` field, but it is not yet wired up to `:name` placeholders in the query text — a query with an unresolved placeholder fails with `ParameterError: Unresolved parameter in query`, regardless of what's passed as parameters. Until that's fixed server-side, `text("... :name ...")` with a `params` dict will not work through this dialect.
+> **Bound parameters** are sent typed, and Opteryx binds each one as `CAST(value AS type)`:
+> `str` → `VARCHAR`, `int` → `INT64`, `float` → `FLOAT64`, `bool` → `BOOL`,
+> `Decimal` → `DECIMAL(p,s)` (taken from the value), `datetime` → `TIMESTAMP`,
+> `date` → `DATE`, `time` → `TIME`, and `None` → a plain `NULL`. Other types raise
+> `NotSupportedError`, including `bytes` (so the PEP 249 `Binary()` constructor can't be bound),
+> lists, `UUID`, and numpy integers such as `np.int64` — convert those with `int(...)` first.
 
 ---
 
@@ -206,6 +211,7 @@ Schemas appear as `workspace.collection` and tables as the datasets in it. Super
   - DATE becomes a `date` and TIME a `time`.
   - DECIMAL becomes a `decimal.Decimal`. The results API sends decimals as JSON numbers, so values with more than 15 significant digits may lose precision.
 - The `result_format` execution option picks how pages are fetched. `"json"` (the default) uses the typed `/results` pages. `"ndjson"` uses untyped rows from `/download`; values arrive as JSON delivers them, so timestamps are strings. `"parquet"` also uses `/download` and needs the `[parquet]` extra. If `/results` can't serve a job, the cursor falls back to `/download`.
+- Results are fetched in pages, but the whole result set is loaded into memory before the first row is returned. `stream_results` is accepted but has no effect; `max_row_buffer` only sets the page size.
 - If execution fails or times out, the DBAPI will raise an appropriate exception (subclass of DatabaseError/OperationalError).
 - `cursor.execute_async(sql)` submits a statement and returns once the job exists; `cursor.statement_handle` is then the job ID, and fetching (or reading `description`/`rowcount`) waits for the job as `execute` would. `cursor.cancel(statement_handle=None)` asks the service to stop a running job (the cursor's own by default) and returns whether it was cancelled; only the client that submitted a job can cancel it. A cursor waiting on a cancelled job raises `OperationalError`.
 

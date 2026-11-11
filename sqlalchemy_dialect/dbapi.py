@@ -12,6 +12,7 @@ import datetime
 import decimal
 import json
 import logging
+import math
 import re
 import time
 from importlib.metadata import version
@@ -89,19 +90,21 @@ class NotSupportedError(DatabaseError):
 
 
 # Type constructors (required by PEP 249)
-def Date(year: int, month: int, day: int) -> str:
+def Date(year: int, month: int, day: int) -> datetime.date:
     """Construct a date value."""
-    return f"{year:04d}-{month:02d}-{day:02d}"
+    return datetime.date(year, month, day)
 
 
-def Time(hour: int, minute: int, second: int) -> str:
+def Time(hour: int, minute: int, second: int) -> datetime.time:
     """Construct a time value."""
-    return f"{hour:02d}:{minute:02d}:{second:02d}"
+    return datetime.time(hour, minute, second)
 
 
-def Timestamp(year: int, month: int, day: int, hour: int, minute: int, second: int) -> str:
+def Timestamp(
+    year: int, month: int, day: int, hour: int, minute: int, second: int
+) -> datetime.datetime:
     """Construct a timestamp value."""
-    return f"{year:04d}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}:{second:02d}"
+    return datetime.datetime(year, month, day, hour, minute, second)
 
 
 def Binary(string: bytes) -> bytes:
@@ -213,6 +216,40 @@ _VALUE_CONVERTERS = {
     "TIME": _to_time,
     "DECIMAL": _to_decimal,
 }
+
+
+def _typed_parameter(value: Any) -> Dict[str, Any]:
+    """A Python value as the typed parameter the jobs API requires: {"type", "value"}.
+
+    The engine binds it as CAST(value AS type). None has no type, so it is sent as
+    NULL, which binds as a bare NULL exactly as one written in the SQL would.
+    """
+    if value is None:
+        return {"type": "NULL", "value": None}
+    if isinstance(value, bool):  # before int: a bool IS an int
+        return {"type": "BOOL", "value": value}
+    if isinstance(value, int):
+        return {"type": "INT64", "value": value}
+    if isinstance(value, float):
+        # JSON has no inf/nan; CAST reads them from text.
+        return {"type": "FLOAT64", "value": value if math.isfinite(value) else repr(value)}
+    if isinstance(value, decimal.Decimal):
+        if not value.is_finite():
+            raise NotSupportedError(f"DECIMAL has no {value}.")
+        # DECIMAL has no default precision; take it from the value itself.
+        sign, digits, exponent = value.as_tuple()
+        scale = max(0, -exponent)
+        precision = max(len(digits) + max(0, exponent), scale, 1)
+        return {"type": f"DECIMAL({precision},{scale})", "value": format(value, "f")}
+    if isinstance(value, datetime.datetime):  # before date: a datetime IS a date
+        return {"type": "TIMESTAMP", "value": value.isoformat()}
+    if isinstance(value, datetime.date):
+        return {"type": "DATE", "value": value.isoformat()}
+    if isinstance(value, datetime.time):
+        return {"type": "TIME", "value": value.isoformat()}
+    if isinstance(value, str):
+        return {"type": "VARCHAR", "value": value}
+    raise NotSupportedError(f"Cannot send a {type(value).__name__} parameter.")
 
 
 def _converter_for(type_name: Any):
@@ -495,6 +532,9 @@ class Cursor:
                 # Replace ? placeholders with :p0, :p1, etc.
                 for i in range(len(parameters)):
                     operation = operation.replace("?", f":p{i}", 1)
+
+        if params_dict is not None:
+            params_dict = {name: _typed_parameter(value) for name, value in params_dict.items()}
 
         # Submit the statement
         start_time = time.time()

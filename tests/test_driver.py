@@ -1,5 +1,7 @@
 """Tests for the Opteryx SQLAlchemy dialect."""
 
+import datetime
+import decimal
 import time
 from unittest.mock import MagicMock
 from unittest.mock import patch
@@ -60,10 +62,29 @@ class TestDBAPI:
 
     def test_type_constructors(self):
         """Test DBAPI type constructor functions."""
-        assert dbapi.Date(2024, 1, 15) == "2024-01-15"
-        assert dbapi.Time(14, 30, 45) == "14:30:45"
-        assert dbapi.Timestamp(2024, 1, 15, 14, 30, 45) == "2024-01-15 14:30:45"
+        assert dbapi.Date(2024, 1, 15) == datetime.date(2024, 1, 15)
+        assert dbapi.Time(14, 30, 45) == datetime.time(14, 30, 45)
+        assert dbapi.Timestamp(2024, 1, 15, 14, 30, 45) == datetime.datetime(2024, 1, 15, 14, 30, 45)
         assert dbapi.Binary(b"test") == b"test"
+
+    def test_parameters_are_sent_typed(self):
+        """Every parameter goes to the jobs API as {"type", "value"}; the engine CASTs it."""
+        t = dbapi._typed_parameter
+        assert t(None) == {"type": "NULL", "value": None}
+        assert t(True) == {"type": "BOOL", "value": True}
+        assert t(42) == {"type": "INT64", "value": 42}
+        assert t(1.5) == {"type": "FLOAT64", "value": 1.5}
+        assert t(float("inf")) == {"type": "FLOAT64", "value": "inf"}
+        assert t(decimal.Decimal("123.456")) == {"type": "DECIMAL(6,3)", "value": "123.456"}
+        assert t(decimal.Decimal("1E+3")) == {"type": "DECIMAL(4,0)", "value": "1000"}
+        assert t(datetime.datetime(2026, 1, 1, 12, 30)) == {"type": "TIMESTAMP", "value": "2026-01-01T12:30:00"}
+        assert t(datetime.date(2026, 1, 1)) == {"type": "DATE", "value": "2026-01-01"}
+        assert t(datetime.time(12, 30)) == {"type": "TIME", "value": "12:30:00"}
+        assert t("x") == {"type": "VARCHAR", "value": "x"}
+        with pytest.raises(dbapi.NotSupportedError):
+            t(b"bytes")
+        with pytest.raises(dbapi.NotSupportedError):
+            t(decimal.Decimal("NaN"))
 
     def test_exception_hierarchy(self):
         """Test that exception classes follow DBAPI hierarchy."""
@@ -386,6 +407,40 @@ class TestCursor:
         assert cursor.description is not None
         assert len(cursor.description) == 2
         assert cursor._rows == [(1, "test")]
+        conn.close()
+
+    @patch("requests.Session.post")
+    @patch("requests.Session.get")
+    def test_execute_sends_typed_parameters(self, mock_get, mock_post):
+        """Positional and named parameters both reach the jobs API typed."""
+        post_response = MagicMock()
+        post_response.status_code = 201
+        post_response.json.return_value = {"execution_id": "handle-123"}
+        mock_post.return_value = post_response
+        get_response = MagicMock()
+        get_response.status_code = 200
+        get_response.json.return_value = {
+            "execution_id": "handle-123",
+            "status": {"state": "SUCCEEDED"},
+            "data": [],
+            "total_rows": 0,
+        }
+        mock_get.return_value = get_response
+
+        conn = dbapi.Connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM t WHERE d = ? AND n = ?", [datetime.date(2026, 1, 1), None])
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["sql_text"] == "SELECT * FROM t WHERE d = :p0 AND n = :p1"
+        assert payload["parameters"] == {
+            "p0": {"type": "DATE", "value": "2026-01-01"},
+            "p1": {"type": "NULL", "value": None},
+        }
+
+        cursor.execute("SELECT * FROM t WHERE price = :price", {"price": decimal.Decimal("1.50")})
+        assert mock_post.call_args.kwargs["json"]["parameters"] == {
+            "price": {"type": "DECIMAL(3,2)", "value": "1.50"}
+        }
         conn.close()
 
     @patch("requests.Session.post")
