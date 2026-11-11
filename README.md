@@ -9,10 +9,10 @@ This project packages a SQLAlchemy dialect and lightweight DBAPI 2.0 adapter tha
 ## Features ✅
 
 - Connect to Opteryx Cloud or self-hosted Opteryx instances with a SQLAlchemy connection URL and optional bearer token.
-- Read-only analytics with transparent polling of query status and paged result fetching.
+- Read-only analytics with transparent polling of query status, and streaming of large results a page at a time.
 - Lightweight DBAPI implementation that maps Opteryx types to SQLAlchemy while surfacing DatabaseError/OperationalError semantics.
 - Works with SQLAlchemy 1.4 and 2.x, including context-managed engines and `text` queries.
-- Schema introspection (`inspect(engine)`) — list schemas, tables, views, and columns (with types) without running SQL.
+- Schema introspection (`inspect(engine)`) — list schemas, tables, views, columns (with types) and declared foreign keys without running SQL.
 - Work with pandas or other tooling that understands SQLAlchemy engines.
 - **Comprehensive debug logging** for troubleshooting connection, authentication, and query execution issues.
 - Install from PyPI (`pip install opteryx-sqlalchemy`) or lock into editable mode for development.
@@ -140,6 +140,34 @@ Note: this requires pandas to be installed in your environment.
 
 ---
 
+## Streaming large results
+
+By default a query's rows are all downloaded before the first one is returned. To read a large result a page at a time, turn on SQLAlchemy's `stream_results` (or, on SQLAlchemy 2.x, `yield_per`):
+
+```python
+from sqlalchemy import text
+
+with engine.connect() as conn:
+    result = conn.execution_options(stream_results=True, max_row_buffer=5000).execute(
+        text("SELECT * FROM public.astronomy.planets")
+    )
+    for row in result:
+        ...
+```
+
+The first page is downloaded when the query finishes, and each later page when you read past the end of the one before. Rows you've already read are dropped, so memory holds about one page. `max_row_buffer` (or the `yield_per` size) sets the page size, which is kept between 100 and 10,000 rows; it defaults to 10,000.
+
+pandas doesn't turn streaming on for `chunksize`, so set it on the connection:
+
+```python
+with engine.connect() as conn:
+    streaming = conn.execution_options(stream_results=True)
+    for chunk in pd.read_sql_query("SELECT * FROM public.astronomy.planets", streaming, chunksize=5000):
+        ...
+```
+
+---
+
 ## Schema Introspection 🔍
 
 Use SQLAlchemy's `inspect()` to browse schemas, tables, views, and columns without writing SQL:
@@ -204,14 +232,16 @@ Schemas appear as `workspace.collection` and tables as the datasets in it. Super
 ## Behavior and Limitations ⚠️
 
 - Opteryx is primarily an analytics engine — the dialect treats the service as read-only. Transactional features are effectively no-ops.
-- Schema introspection (`has_table`, `get_table_names`, `get_view_names`, `get_schema_names`, `get_columns`) is supported. Opteryx has no primary keys, foreign keys, or indexes, so `get_pk_constraint`/`get_foreign_keys`/`get_indexes` always return empty.
+- Schema introspection (`has_table`, `get_table_names`, `get_view_names`, `get_schema_names`, `get_columns`, `get_foreign_keys`) is supported.
+- `get_foreign_keys` returns the relationships declared in Opteryx. Opteryx doesn't enforce them, and only lists a foreign key when you can see the table it refers to.
+- Opteryx has no primary keys or indexes, so `get_pk_constraint` and `get_indexes` always return empty.
 - The dialect maps Opteryx native types to SQLAlchemy types as best-effort but does not implement a complete type mapping for every possible backend type.
 - Results are typed. Each `cursor.description` entry carries the engine's type name as its type code (`"TIMESTAMP[us]"`, `"DATE"`, `"DECIMAL(15, 2)"`, `"INT64"`, ...), and these compare equal to the PEP 249 `DATETIME`, `NUMBER`, `STRING` and `BINARY` objects. Values come back as Python types:
   - TIMESTAMP becomes a timezone-aware `datetime` in UTC.
   - DATE becomes a `date` and TIME a `time`.
   - DECIMAL becomes a `decimal.Decimal`. The results API sends decimals as JSON numbers, so values with more than 15 significant digits may lose precision.
 - The `result_format` execution option picks how pages are fetched. `"json"` (the default) uses the typed `/results` pages. `"ndjson"` uses untyped rows from `/download`; values arrive as JSON delivers them, so timestamps are strings. `"parquet"` also uses `/download` and needs the `[parquet]` extra. If `/results` can't serve a job, the cursor falls back to `/download`.
-- Results are fetched in pages, but the whole result set is loaded into memory before the first row is returned. `stream_results` is accepted but has no effect; `max_row_buffer` only sets the page size.
+- Results are fetched in pages. By default every page is downloaded before the first row is returned; with `stream_results` or `yield_per`, pages are downloaded as rows are read (see [Streaming large results](#streaming-large-results)). While streaming, `rowcount` comes from the server's row total, or is -1 if the server doesn't send one.
 - If execution fails or times out, the DBAPI will raise an appropriate exception (subclass of DatabaseError/OperationalError).
 - `cursor.execute_async(sql)` submits a statement and returns once the job exists; `cursor.statement_handle` is then the job ID, and fetching (or reading `description`/`rowcount`) waits for the job as `execute` would. `cursor.cancel(statement_handle=None)` asks the service to stop a running job (the cursor's own by default) and returns whether it was cancelled; only the client that submitted a job can cancel it. A cursor waiting on a cancelled job raises `OperationalError`.
 

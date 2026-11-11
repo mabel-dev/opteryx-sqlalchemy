@@ -315,6 +315,64 @@ class TestConnection:
         conn = dbapi.Connection(host="opteryx.app", username="user", token="raw-token", ssl=True)
         assert conn.get_odata_metadata() == {}
 
+    @patch("requests.Session.get")
+    @patch("requests.Session.post")
+    def test_get_odata_foreign_keys(self, mock_post, mock_get):
+        """Declared relationships come back as foreign keys keyed by dotted resource name."""
+        post_response = MagicMock()
+        post_response.status_code = 200
+        post_response.json.return_value = {"access_token": "jwt-token", "token_type": "bearer"}
+        mock_post.return_value = post_response
+
+        # Shaped like odata.opteryx's $metadata: a Custom.Resource annotation per
+        # type, NavigationProperty after the properties. "orphan" points at a type
+        # with no resource annotation and must be skipped.
+        metadata_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<edmx:Edmx xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx" Version="4.0">
+  <edmx:DataServices>
+    <Schema Namespace="OData" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="public_examples_moons">
+        <Annotation Term="Custom.Resource" String="public.examples.moons" />
+        <Key><PropertyRef Name="id" /></Key>
+        <Property Name="id" Type="Edm.Int64" Nullable="false" />
+        <Property Name="planet_id" Type="Edm.Int64" Nullable="true" />
+        <NavigationProperty Name="planet" Type="OData.public_examples_planets" Nullable="true">
+          <ReferentialConstraint Property="planet_id" ReferencedProperty="id" />
+        </NavigationProperty>
+        <NavigationProperty Name="orphan" Type="OData.unknown_type" Nullable="true">
+          <ReferentialConstraint Property="planet_id" ReferencedProperty="id" />
+        </NavigationProperty>
+      </EntityType>
+      <EntityType Name="public_examples_planets">
+        <Annotation Term="Custom.Resource" String="public.examples.planets" />
+        <Key><PropertyRef Name="id" /></Key>
+        <Property Name="id" Type="Edm.Int64" Nullable="false" />
+      </EntityType>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>"""
+        get_response = MagicMock()
+        get_response.status_code = 200
+        get_response.content = metadata_xml.encode("utf-8")
+        mock_get.return_value = get_response
+
+        conn = dbapi.Connection(host="opteryx.app", username="user", token="raw-token", ssl=True)
+        assert conn.get_odata_foreign_keys() == {
+            "public.examples.moons": [
+                {
+                    "name": "planet",
+                    "constrained_columns": ["planet_id"],
+                    "referred_schema": "public.examples",
+                    "referred_table": "planets",
+                    "referred_columns": ["id"],
+                    "options": {},
+                }
+            ]
+        }
+        # Columns still parse, and both calls share one $metadata fetch.
+        assert [p[0] for p in conn.get_odata_metadata()["public_examples_moons"]] == ["id", "planet_id"]
+        assert mock_get.call_count == 1
+
 
 class TestCursor:
     """Tests for the Cursor class."""
@@ -919,6 +977,117 @@ class TestTypedResults:
         assert dbapi._to_decimal(True) is True
 
 
+class TestStreaming:
+    """Pages are read as rows are fetched when streaming, all at once otherwise."""
+
+    @staticmethod
+    def _fake_jobs(total, include_total=True):
+        """A GET side effect serving a COMPLETED job and /results pages of `total` rows.
+
+        Returns (side_effect, offsets) where offsets records each page request.
+        """
+        offsets = []
+
+        def get(url, params=None, timeout=None):
+            if url.endswith("/results"):
+                offset, num_rows = params["offset"], params["num_rows"]
+                offsets.append(offset)
+                values = list(range(offset, min(offset + num_rows, total)))
+                body = {"data": [{"name": "n", "type": "INT64", "values": values}]}
+                if include_total:
+                    body["total_rows"] = total
+                return _response(json_body=body)
+            return _response(json_body=_COMPLETED)
+
+        return get, offsets
+
+    def _cursor(self, mock_get, mock_post, total, stream, page=100, include_total=True):
+        mock_post.return_value = _response(json_body={"execution_id": "h"})
+        mock_get.side_effect, offsets = self._fake_jobs(total, include_total)
+        cursor = dbapi.Connection().cursor()
+        cursor._opteryx_stream_results_requested = stream
+        cursor._opteryx_max_row_buffer = page
+        return cursor, offsets
+
+    @patch("requests.Session.post")
+    @patch("requests.Session.get")
+    def test_streaming_reads_pages_on_demand(self, mock_get, mock_post):
+        cursor, offsets = self._cursor(mock_get, mock_post, total=250, stream=True)
+        cursor.execute("SELECT n FROM t")
+        assert offsets == [0]  # only the first page, for the description
+        assert cursor.description[0][0] == "n"
+        assert cursor.rowcount == 250  # from total_rows, not counted locally
+
+        assert [r[0] for r in cursor.fetchmany(150)] == list(range(150))
+        assert offsets == [0, 100]
+        # Rows already handed out are dropped from the buffer.
+        assert len(cursor._rows) - cursor._row_index == 50
+
+        assert [r[0] for r in cursor.fetchall()] == list(range(150, 250))
+        assert offsets == [0, 100, 200]
+        assert cursor.fetchone() is None
+        assert offsets == [0, 100, 200]  # no request past the end
+
+    @patch("requests.Session.post")
+    @patch("requests.Session.get")
+    def test_streaming_without_total_rows(self, mock_get, mock_post):
+        cursor, offsets = self._cursor(
+            mock_get, mock_post, total=150, stream=True, include_total=False
+        )
+        cursor.execute("SELECT n FROM t")
+        assert cursor.rowcount == -1
+        assert [r[0] for r in cursor] == list(range(150))
+        assert offsets == [0, 100]  # the short second page ends the read
+
+    @patch("requests.Session.post")
+    @patch("requests.Session.get")
+    def test_default_reads_every_page_at_execute(self, mock_get, mock_post):
+        cursor, offsets = self._cursor(mock_get, mock_post, total=250, stream=False)
+        cursor.execute("SELECT n FROM t")
+        assert offsets == [0, 100, 200]
+        assert cursor.rowcount == 250
+        assert len(cursor.fetchall()) == 250
+
+    @patch("requests.Session.post")
+    @patch("requests.Session.get")
+    def test_page_size_is_clamped_to_what_results_serves(self, mock_get, mock_post):
+        """A buffer above 10000 used to make a full page look short and end the read."""
+        cursor, offsets = self._cursor(
+            mock_get, mock_post, total=10_050, stream=False, page=20_000, include_total=False
+        )
+        cursor.execute("SELECT n FROM t")
+        assert cursor.rowcount == 10_050
+        assert offsets == [0, 10_000]
+
+    @patch("requests.Session.post")
+    @patch("requests.Session.get")
+    def test_sqlalchemy_stream_results_and_yield_per(self, mock_get, mock_post):
+        import sqlalchemy
+        from sqlalchemy import create_engine
+        from sqlalchemy import text
+
+        engine = create_engine("opteryx://localhost:8000/")
+        option_sets = [{"stream_results": True, "max_row_buffer": 100}]
+        if sqlalchemy.__version__.startswith("2."):
+            option_sets.append({"yield_per": 100})  # a Core execution option from 2.0
+        for options in option_sets:
+            mock_post.return_value = _response(json_body={"execution_id": "h"})
+            mock_get.side_effect, offsets = self._fake_jobs(250)
+            with engine.connect() as conn:
+                result = conn.execution_options(**options).execute(text("SELECT n FROM t"))
+                first = result.fetchmany(10)
+                assert [r[0] for r in first] == list(range(10))
+                assert offsets == [0], options
+                assert len(result.fetchall()) == 240
+                assert offsets == [0, 100, 200], options
+
+        # Without streaming, execute reads everything up front.
+        mock_get.side_effect, offsets = self._fake_jobs(250)
+        with engine.connect() as conn:
+            conn.execution_options(max_row_buffer=100).execute(text("SELECT n FROM t"))
+            assert offsets == [0, 100, 200]
+
+
 class TestDialect:
     """Tests for the SQLAlchemy dialect."""
 
@@ -1152,6 +1321,33 @@ class TestIntrospection:
         sa_connection, _ = self._fake_sa_connection(metadata=self.METADATA)
         dialect = OpteryxDialect()
         assert dialect.get_columns(sa_connection, "does_not_exist", schema="public.examples") == []
+
+    def test_get_foreign_keys(self):
+        """Declared foreign keys are reported for their table and only that table."""
+        fk = {
+            "name": "planet",
+            "constrained_columns": ["planet_id"],
+            "referred_schema": "public.examples",
+            "referred_table": "planets",
+            "referred_columns": ["id"],
+            "options": {},
+        }
+        sa_connection, _ = self._fake_sa_connection()
+        raw = sa_connection.connection.dbapi_connection
+        raw.get_odata_foreign_keys.return_value = {"public.examples.moons": [fk]}
+        dialect = OpteryxDialect()
+        assert dialect.get_foreign_keys(sa_connection, "moons", schema="public.examples") == [fk]
+        assert dialect.get_foreign_keys(sa_connection, "planets", schema="public.examples") == []
+
+    def test_no_primary_keys_or_indexes(self):
+        """$metadata's <Key> is a placeholder (always the first column), so no PK is reported."""
+        sa_connection, _ = self._fake_sa_connection(metadata=self.METADATA)
+        dialect = OpteryxDialect()
+        assert dialect.get_pk_constraint(sa_connection, "planets", schema="public.examples") == {
+            "constrained_columns": [],
+            "name": None,
+        }
+        assert dialect.get_indexes(sa_connection, "planets", schema="public.examples") == []
 
 
 class TestConnect:

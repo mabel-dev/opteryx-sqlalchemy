@@ -316,6 +316,11 @@ class Cursor:
         # Set by execute_async: the job is submitted but not yet waited on.
         self._pending = False
         self._submitted_at = 0.0
+        # Paging state for the current result set (see _fetch_results).
+        self._total_rows: Optional[int] = None
+        self._next_offset = 0
+        self._more_pages = False
+        self._page_size = _DEFAULT_PAGE_ROWS
 
         # Execution option placeholders (may be set by dialect.do_execute)
         self._opteryx_execution_options: dict = {}
@@ -439,7 +444,7 @@ class Cursor:
 
     @property
     def rowcount(self) -> int:
-        """Number of rows affected by the last operation."""
+        """Number of rows in the result, or -1 when streaming and the server didn't say."""
         self._wait_if_pending()
         return self._rowcount
 
@@ -465,6 +470,7 @@ class Cursor:
         """Close the cursor."""
         self._closed = True
         self._rows = []
+        self._more_pages = False
         self._description = None
 
     def _check_closed(self) -> None:
@@ -541,6 +547,9 @@ class Cursor:
         self._rowcount = -1
         self._statement_handle = None
         self._pending = False
+        self._total_rows = None
+        self._next_offset = 0
+        self._more_pages = False
 
         # Log query (truncate if too long)
         query_preview = operation[:200] + "..." if len(operation) > 200 else operation
@@ -676,8 +685,56 @@ class Cursor:
             for row_index in range(max_rows)
         ]
 
+    def _describe(self, columns: Sequence[Dict[str, Any]]) -> None:
+        # type_code is the engine's SQL type name ("TIMESTAMP[us]", "INT64",
+        # ...) when the payload carries one, None otherwise (NDJSON, parquet).
+        self._description = [
+            (col.get("name", f"col{i}"), col.get("type"), None, None, None, None, None)
+            for i, col in enumerate(columns)
+        ]
+
+    def _rows_from_page(self, result: Dict[str, Any]) -> List[Tuple[Any, ...]]:
+        """Rows in one results payload, recording total_rows and the description on the way."""
+        if self._total_rows is None and "total_rows" in result:
+            try:
+                self._total_rows = int(result.get("total_rows", 0))
+            except (TypeError, ValueError):
+                self._total_rows = None
+
+        columns_meta = result.get("columns", [])
+        if columns_meta and self._description is None:
+            self._describe(columns_meta)
+
+        data = result.get("data", [])
+        if not data:
+            return []
+        if isinstance(data[0], dict) and "values" in data[0]:
+            # Columnar format: each dict has {name, type, values: [...]}
+            if self._description is None:
+                self._describe(data)
+            data = [
+                dict(col, values=[convert(v) for v in col.get("values") or []])
+                if (convert := _converter_for(col.get("type")))
+                else col
+                for col in data
+                if isinstance(col, dict)
+            ]
+            return self._rows_from_columnar_data(data)
+        if isinstance(data[0], dict):
+            # Row format: each dict is a row with {col1: val1, col2: val2, ...}
+            if self._description is None:
+                self._describe([{"name": name} for name in data[0]])
+            col_order = [col[0] for col in (self._description or [])]
+            return [tuple(row_dict.get(col) for col in col_order) for row_dict in data]
+        # List/tuple format
+        return [tuple(row) for row in data]
+
     def _fetch_results(self, status_result: Optional[Dict[str, Any]] = None) -> None:
-        """Fetch results from a completed statement.
+        """Start reading the results of a completed statement.
+
+        Normally every page is read now. When streaming was requested (SQLAlchemy's
+        `stream_results` / `yield_per`), only the first page is read, for the
+        description; the fetch methods read the rest one page at a time.
 
         Args:
             status_result: The final status payload from the poll loop, if
@@ -686,101 +743,59 @@ class Cursor:
         if not self._statement_handle:
             return
 
-        page_size = max(self._opteryx_max_row_buffer or _DEFAULT_PAGE_ROWS, self._arraysize)
-        offset = 0
-        has_description = False
-        rows: List[Tuple[Any, ...]] = []
-        total_rows: Optional[int] = None
-
-        def describe(columns: Sequence[Dict[str, Any]]) -> None:
-            # type_code is the engine's SQL type name ("TIMESTAMP[us]", "INT64",
-            # ...) when the payload carries one, None otherwise (NDJSON, parquet).
-            self._description = [
-                (col.get("name", f"col{i}"), col.get("type"), None, None, None, None, None)
-                for i, col in enumerate(columns)
-            ]
-
-        def process_result_page(result: Dict[str, Any]) -> int:
-            nonlocal has_description, total_rows
-            new_rows = 0
-            if total_rows is None and "total_rows" in result:
-                try:
-                    total_rows = int(result.get("total_rows", 0))
-                except (TypeError, ValueError):
-                    total_rows = None
-
-            columns_meta = result.get("columns", [])
-            if columns_meta and not has_description:
-                describe(columns_meta)
-                has_description = True
-
-            data = result.get("data", [])
-            if data:
-                if isinstance(data[0], dict) and "values" in data[0]:
-                    # Columnar format: each dict has {name, type, values: [...]}
-                    if not has_description:
-                        describe(data)
-                        has_description = True
-                    data = [
-                        dict(col, values=[convert(v) for v in col.get("values") or []])
-                        if (convert := _converter_for(col.get("type")))
-                        else col
-                        for col in data
-                        if isinstance(col, dict)
-                    ]
-                    column_rows = self._rows_from_columnar_data(data)
-                    rows.extend(column_rows)
-                    new_rows = len(column_rows)
-                elif isinstance(data[0], dict):
-                    # Row format: each dict is a row with {col1: val1, col2: val2, ...}
-                    if not has_description and data:
-                        # Extract column names from first row
-                        col_names = list(data[0].keys())
-                        self._description = [
-                            (col_name, None, None, None, None, None, None) for col_name in col_names
-                        ]
-                        has_description = True
-                    # Convert each row dict to a tuple in the correct column order
-                    col_order = [col[0] for col in (self._description or [])]
-                    for row_dict in data:
-                        row_tuple = tuple(row_dict.get(col) for col in col_order)
-                        rows.append(row_tuple)
-                    new_rows = len(data)
-                else:
-                    # List/tuple format
-                    for row in data:
-                        rows.append(tuple(row))
-                    new_rows = len(data)
-
-            return new_rows
-
+        # /results serves 100..10000 rows a page. Asking for a size it would
+        # clamp would make a full page look short, and end the read early.
+        self._page_size = min(
+            max(self._opteryx_max_row_buffer or _DEFAULT_PAGE_ROWS, self._arraysize, _MIN_RESULTS_PAGE),
+            _MAX_RESULTS_PAGE,
+        )
         if status_result is None:
             status_result = self._connection._get_statement_status(self._statement_handle)  # pylint: disable=protected-access
-        process_result_page(status_result)
-        offset = len(rows)
+        self._rows = self._rows_from_page(status_result)
+        self._next_offset = len(self._rows)
+        self._more_pages = True
 
-        while True:
-            if total_rows is not None and offset >= total_rows:
-                break
+        if self._opteryx_stream_results_requested:
+            self._read_page()
+            self._rowcount = -1 if self._total_rows is None else self._total_rows
+        else:
+            while self._read_page():
+                pass
+            self._rowcount = len(self._rows)
 
-            result = self._connection._get_statement_results(  # pylint: disable=protected-access
-                self._statement_handle,
-                num_rows=page_size,
-                offset=offset,
-                file_format=self._opteryx_result_format,
-            )
+    def _read_page(self) -> bool:
+        """Read the next page of results into the row buffer. False once there are no more."""
+        if not self._more_pages:
+            return False
+        if self._total_rows is not None and self._next_offset >= self._total_rows:
+            self._more_pages = False
+            return False
 
-            fetched_this_page = process_result_page(result)
-            if fetched_this_page <= 0:
-                break
+        result = self._connection._get_statement_results(  # pylint: disable=protected-access
+            self._statement_handle,
+            num_rows=self._page_size,
+            offset=self._next_offset,
+            file_format=self._opteryx_result_format,
+        )
+        new_rows = self._rows_from_page(result)
+        if not new_rows:
+            self._more_pages = False
+            return False
 
-            offset += fetched_this_page
-            if fetched_this_page < page_size:
-                break
+        self._next_offset += len(new_rows)
+        if len(new_rows) < self._page_size:
+            self._more_pages = False
+        if self._opteryx_stream_results_requested:
+            # Drop rows already handed out, so memory holds about one page.
+            self._rows = self._rows[self._row_index :]
+            self._row_index = 0
+        self._rows.extend(new_rows)
+        return True
 
-        # Finalize rows and counts
-        self._rows = rows
-        self._rowcount = len(self._rows)
+    def _buffer_rows(self, wanted: Optional[int]) -> None:
+        """Read pages until `wanted` unread rows are buffered (all of them for None)."""
+        while (wanted is None or len(self._rows) - self._row_index < wanted) and self._read_page():
+            pass
 
     def executemany(
         self,
@@ -797,6 +812,7 @@ class Cursor:
         """Fetch the next row of a query result set."""
         self._check_closed()
         self._wait_if_pending()
+        self._buffer_rows(1)
         if self._row_index >= len(self._rows):
             return None
         row = self._rows[self._row_index]
@@ -809,6 +825,7 @@ class Cursor:
         self._wait_if_pending()
         if size is None:
             size = self._arraysize
+        self._buffer_rows(size)
         rows = self._rows[self._row_index : self._row_index + size]
         self._row_index += len(rows)
         return rows
@@ -817,6 +834,7 @@ class Cursor:
         """Fetch all remaining rows."""
         self._check_closed()
         self._wait_if_pending()
+        self._buffer_rows(None)
         rows = self._rows[self._row_index :]
         self._row_index = len(self._rows)
         return rows
@@ -884,6 +902,7 @@ class Connection:
         self._jwt_token_expiry: Optional[float] = None
         self._odata_service_document_cache: Optional[List[Dict[str, Any]]] = None
         self._odata_metadata_cache: Optional[Dict[str, List[Tuple[str, str, bool]]]] = None
+        self._odata_foreign_keys_cache: Optional[Dict[str, List[Dict[str, Any]]]] = None
 
         # Build base URL
         scheme = "https" if ssl else "http"
@@ -1022,10 +1041,39 @@ class Connection:
             logger.warning("Failed to parse OData $metadata XML: %s", e)
             return {}
 
+        # The dotted resource each EntityType stands for. The underscored name
+        # can't be split back apart, so the server annotates every type with it.
+        resources: Dict[str, str] = {}
+        for entity_type in root.iter(f"{edm_ns}EntityType"):
+            for annotation in entity_type.findall(f"{edm_ns}Annotation"):
+                if annotation.get("Term") == "Custom.Resource" and annotation.get("String"):
+                    resources[entity_type.get("Name", "")] = annotation.get("String", "")
+
+        foreign_keys: Dict[str, List[Dict[str, Any]]] = {}
         for entity_type in root.iter(f"{edm_ns}EntityType"):
             name = entity_type.get("Name")
             if not name:
                 continue
+            near = resources.get(name)
+            for navigation in entity_type.findall(f"{edm_ns}NavigationProperty"):
+                # Declared (not enforced) foreign keys. The server only emits
+                # them when both ends are visible to this caller.
+                far = resources.get(navigation.get("Type", "").removeprefix("OData."))
+                constraints = navigation.findall(f"{edm_ns}ReferentialConstraint")
+                if not near or not far or not constraints:
+                    continue
+                referred_schema, _, referred_table = far.rpartition(".")
+                foreign_keys.setdefault(near, []).append(
+                    {
+                        "name": navigation.get("Name"),
+                        "constrained_columns": [c.get("Property") for c in constraints],
+                        "referred_schema": referred_schema or None,
+                        "referred_table": referred_table,
+                        "referred_columns": [c.get("ReferencedProperty") for c in constraints],
+                        "options": {},
+                    }
+                )
+
             properties = []
             for prop in entity_type.findall(f"{edm_ns}Property"):
                 prop_name = prop.get("Name")
@@ -1036,7 +1084,18 @@ class Connection:
                 properties.append((prop_name, prop_type, nullable))
             entity_types[name] = properties
         self._odata_metadata_cache = entity_types
+        self._odata_foreign_keys_cache = foreign_keys
         return entity_types
+
+    def get_odata_foreign_keys(self) -> Dict[str, List[Dict[str, Any]]]:
+        """Declared foreign keys from the $metadata document, keyed by dotted resource name.
+
+        Each value is a list of SQLAlchemy ReflectedForeignKeyConstraint dicts.
+        Opteryx doesn't enforce these; they record relationships people declared.
+        Shares the $metadata fetch and cache with get_odata_metadata.
+        """
+        self.get_odata_metadata()
+        return self._odata_foreign_keys_cache or {}
 
     def _check_closed(self) -> None:
         """Raise exception if connection is closed."""
