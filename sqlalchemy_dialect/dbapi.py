@@ -24,6 +24,7 @@ from typing import Sequence
 from typing import Tuple
 from typing import Union
 from urllib.parse import urljoin
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
@@ -47,6 +48,22 @@ _TOKEN_EXPIRY_SKEW_SECONDS = 30.0
 _DEFAULT_PAGE_ROWS = 10_000
 _MIN_RESULTS_PAGE = 100
 _MAX_RESULTS_PAGE = 10_000
+
+# Long-polling. The poll asks /results with `wait`, and the jobs service holds
+# the request until the statement's state changes: a finished statement is
+# noticed within ~100ms instead of up to one 2.5s backoff step later, and its
+# first page arrives in that same response rather than after a separate
+# /status call. The wait stays this far inside the request timeout so a held
+# request is never cut off by it.
+_LONG_POLL_MAX_WAIT_SECONDS = 20.0
+_LONG_POLL_TIMEOUT_MARGIN_SECONDS = 5.0
+# An answer that comes back sooner than this, with no state change, was not
+# held (an older server, or its waiter cap was reached): back off as before.
+_LONG_POLL_HELD_SECONDS = 0.5
+
+# Pages of a fully-read result fetched at once. Each page is an independent
+# request, so a large result reads in roughly 1/N of the time.
+_PARALLEL_PAGE_READS = 4
 
 
 class Error(Exception):
@@ -282,6 +299,20 @@ def _number_placeholders(operation: str) -> str:
 def _converter_for(type_name: Any):
     """Python-value converter for a results-API type name, or None if JSON already fits."""
     return _VALUE_CONVERTERS.get(_base_type_name(type_name))
+
+
+def _typed_page(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """A /results 200 body as the cursor's page dict: typed columns, columnar data, total_rows."""
+    columns = [col for col in (payload.get("data") or []) if isinstance(col, dict)]
+    result: Dict[str, Any] = {
+        "columns": [{"name": col.get("name"), "type": col.get("type")} for col in columns],
+        # A page past the end (or an empty result) declares its columns
+        # without a values array; keep the columns, report no rows.
+        "data": columns if any("values" in col for col in columns) else [],
+    }
+    if "total_rows" in payload:
+        result["total_rows"] = payload["total_rows"]
+    return result
 
 
 def _redact_secret(value: Optional[str], visible: int = 4) -> str:
@@ -609,8 +640,18 @@ class Cursor:
 
         logger.debug("Polling for execution_id: %s", self._statement_handle)
 
+        page_size = self._results_page_size()
+        # The first page rides along with completion only when it is the page
+        # the cursor would have read anyway; other formats read from /download.
+        first_page_rows = page_size if self._opteryx_result_format == "json" else _MIN_RESULTS_PAGE
+        last_state = None
+
         while elapsed < max_wait:
-            status = self._connection._get_statement_status(self._statement_handle)
+            asked_at = time.monotonic()
+            status, first_page = self._connection._poll_statement(  # pylint: disable=protected-access
+                self._statement_handle, num_rows=first_page_rows
+            )
+            held = time.monotonic() - asked_at >= _LONG_POLL_HELD_SECONDS
             elapsed = time.monotonic() - start_time
             raw_state = status.get("status")
 
@@ -635,7 +676,9 @@ class Cursor:
 
             if normalized_state in ("COMPLETED", "SUCCEEDED", "INCHOATE"):
                 logger.debug("Query execution completed with state: %s", normalized_state)
-                self._fetch_results(status)
+                if first_page is not None and self._opteryx_result_format != "json":
+                    first_page = {}  # completion is all it said; rows come from /download
+                self._fetch_results(first_page if first_page is not None else status)
                 return
             if normalized_state == "CANCELLED":
                 logger.info("Statement %s was cancelled", self._statement_handle)
@@ -652,8 +695,14 @@ class Cursor:
                 raise ProgrammingError(error_message)
             if normalized_state in ("UNKNOWN", "SUBMITTED", "EXECUTING", "RUNNING"):
                 logger.debug("Query state: %s (elapsed: %.1fs)", normalized_state, elapsed)
-                time.sleep(poll_interval)
-                poll_interval = min(poll_interval * 1.5, 2.5)
+                changed = normalized_state != last_state
+                last_state = normalized_state
+                if held or changed:
+                    # The server already waited for us, or there is news: ask again now.
+                    poll_interval = 0.05
+                else:
+                    time.sleep(poll_interval)
+                    poll_interval = min(poll_interval * 1.5, 2.5)
                 elapsed = time.monotonic() - start_time
                 continue
 
@@ -743,12 +792,7 @@ class Cursor:
         if not self._statement_handle:
             return
 
-        # /results serves 100..10000 rows a page. Asking for a size it would
-        # clamp would make a full page look short, and end the read early.
-        self._page_size = min(
-            max(self._opteryx_max_row_buffer or _DEFAULT_PAGE_ROWS, self._arraysize, _MIN_RESULTS_PAGE),
-            _MAX_RESULTS_PAGE,
-        )
+        self._page_size = self._results_page_size()
         if status_result is None:
             status_result = self._connection._get_statement_status(self._statement_handle)  # pylint: disable=protected-access
         self._rows = self._rows_from_page(status_result)
@@ -756,12 +800,53 @@ class Cursor:
         self._more_pages = True
 
         if self._opteryx_stream_results_requested:
-            self._read_page()
+            if not self._rows:
+                self._read_page()  # for the description
             self._rowcount = -1 if self._total_rows is None else self._total_rows
         else:
+            self._read_remaining_pages()
+            self._rowcount = len(self._rows)
+
+    def _results_page_size(self) -> int:
+        # /results serves 100..10000 rows a page. Asking for a size it would
+        # clamp would make a full page look short, and end the read early.
+        return min(
+            max(self._opteryx_max_row_buffer or _DEFAULT_PAGE_ROWS, self._arraysize, _MIN_RESULTS_PAGE),
+            _MAX_RESULTS_PAGE,
+        )
+
+    def _read_remaining_pages(self) -> None:
+        """Read every remaining page: in parallel when total_rows says how many there are."""
+        if (
+            not self._more_pages
+            or self._total_rows is None
+            or self._total_rows - self._next_offset <= self._page_size
+        ):
             while self._read_page():
                 pass
-            self._rowcount = len(self._rows)
+            return
+
+        offsets = list(range(self._next_offset, self._total_rows, self._page_size))
+
+        def fetch(offset: int) -> Dict[str, Any]:
+            return self._connection._get_statement_results(  # pylint: disable=protected-access
+                self._statement_handle,
+                num_rows=self._page_size,
+                offset=offset,
+                file_format=self._opteryx_result_format,
+            )
+
+        with ThreadPoolExecutor(max_workers=min(_PARALLEL_PAGE_READS, len(offsets))) as pool:
+            pages = list(pool.map(fetch, offsets))
+        # Assembled in offset order, on this thread: _rows_from_page records
+        # the description and total_rows as it goes.
+        for page in pages:
+            new_rows = self._rows_from_page(page)
+            if not new_rows:
+                break
+            self._rows.extend(new_rows)
+            self._next_offset += len(new_rows)
+        self._more_pages = False
 
     def _read_page(self) -> bool:
         """Read the next page of results into the row buffer. False once there are no more."""
@@ -1273,6 +1358,57 @@ class Connection:
             logger.error("Connection error checking status: %s", e)
             raise OperationalError(f"Connection error: {e}") from e
 
+    def _long_poll_wait(self) -> float:
+        return max(
+            0.0,
+            min(_LONG_POLL_MAX_WAIT_SECONDS, self._timeout - _LONG_POLL_TIMEOUT_MARGIN_SECONDS),
+        )
+
+    def _poll_statement(
+        self, statement_handle: str, num_rows: int = _MIN_RESULTS_PAGE
+    ) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+        """Long-poll /results once.
+
+        Returns (status, None) while the statement runs - the 202 body, which
+        always carries `status` - or ({"status": "COMPLETED"}, first_page) once
+        it has completed, the page in the shape `_get_typed_results` returns.
+        """
+        self._check_closed()
+        url = urljoin(self._data_base_url() + "/", f"api/v1/jobs/{statement_handle}/results")
+        params = {
+            "num_rows": min(max(int(num_rows), _MIN_RESULTS_PAGE), _MAX_RESULTS_PAGE),
+            "offset": 0,
+            "wait": self._long_poll_wait(),
+        }
+        try:
+            response = self._do_request_with_retry(
+                lambda: self._session.get(url, params=params, timeout=self._timeout)
+            )
+            payload = response.json()
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None:
+                status_code = e.response.status_code
+                try:
+                    detail = e.response.json().get("detail", str(e))
+                except (ValueError, json.JSONDecodeError, AttributeError):
+                    detail = e.response.text or str(e)
+                if status_code in (401, 403):
+                    raise OperationalError(f"Authentication error: {detail}") from e
+                if status_code == 404:
+                    raise ProgrammingError("Statement not found") from e
+                raise DatabaseError(f"HTTP error: {detail}") from e
+            raise DatabaseError(f"HTTP error: {e}") from e
+        except requests.exceptions.RequestException as e:
+            raise OperationalError(f"Connection error: {e}") from e
+        except ValueError as e:
+            raise DatabaseError(f"Malformed response polling statement: {e}") from e
+
+        if not isinstance(payload, dict):
+            raise DatabaseError("Malformed response polling statement")
+        if response.status_code == 202 or "status" in payload:
+            return payload, None
+        return {"status": "COMPLETED"}, _typed_page(payload)
+
     def _get_typed_results(
         self,
         statement_handle: str,
@@ -1326,16 +1462,7 @@ class Connection:
             logger.debug("Error fetching typed results: %s, falling back to /download", e)
             return None
 
-        columns = [col for col in (payload.get("data") or []) if isinstance(col, dict)]
-        result: Dict[str, Any] = {
-            "columns": [{"name": col.get("name"), "type": col.get("type")} for col in columns],
-            # A page past the end (or an empty result) declares its columns
-            # without a values array; keep the columns, report no rows.
-            "data": columns if any("values" in col for col in columns) else [],
-        }
-        if "total_rows" in payload:
-            result["total_rows"] = payload["total_rows"]
-        return result
+        return _typed_page(payload)
 
     def _get_statement_results(
         self,

@@ -1044,7 +1044,9 @@ class TestStreaming:
     def test_default_reads_every_page_at_execute(self, mock_get, mock_post):
         cursor, offsets = self._cursor(mock_get, mock_post, total=250, stream=False)
         cursor.execute("SELECT n FROM t")
-        assert offsets == [0, 100, 200]
+        # Pages after the first are read concurrently, so in no fixed order.
+        assert sorted(offsets) == [0, 100, 200]
+        assert [r[0] for r in cursor._rows] == list(range(250))
         assert cursor.rowcount == 250
         assert len(cursor.fetchall()) == 250
 
