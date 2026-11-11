@@ -252,6 +252,33 @@ def _typed_parameter(value: Any) -> Dict[str, Any]:
     raise NotSupportedError(f"Cannot send a {type(value).__name__} parameter.")
 
 
+# A ? is a placeholder only outside quotes and comments. Each alternative before
+# the last matches a whole quoted string or comment, so a ? inside one is skipped.
+_PLACEHOLDER_SCAN = re.compile(
+    r"'(?:[^']|'')*'"  # string literal, '' escapes a quote
+    r'|"(?:[^"]|"")*"'  # quoted identifier
+    r"|`[^`]*`"  # backtick identifier
+    r"|--[^\n]*"  # line comment
+    r"|/\*.*?\*/"  # block comment
+    r"|\?",
+    re.DOTALL,
+)
+
+
+def _number_placeholders(operation: str) -> str:
+    """Rewrite each ? placeholder as :p0, :p1, ... leaving ? in quotes and comments alone."""
+    count = 0
+
+    def replace(match: re.Match) -> str:
+        nonlocal count
+        if match.group() != "?":
+            return match.group()
+        count += 1
+        return f":p{count - 1}"
+
+    return _PLACEHOLDER_SCAN.sub(replace, operation)
+
+
 def _converter_for(type_name: Any):
     """Python-value converter for a results-API type name, or None if JSON already fits."""
     return _VALUE_CONVERTERS.get(_base_type_name(type_name))
@@ -529,9 +556,7 @@ class Cursor:
             else:
                 # Convert positional to named parameters
                 params_dict = {f"p{i}": v for i, v in enumerate(parameters)}
-                # Replace ? placeholders with :p0, :p1, etc.
-                for i in range(len(parameters)):
-                    operation = operation.replace("?", f":p{i}", 1)
+                operation = _number_placeholders(operation)
 
         if params_dict is not None:
             params_dict = {name: _typed_parameter(value) for name, value in params_dict.items()}

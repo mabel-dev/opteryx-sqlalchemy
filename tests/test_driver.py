@@ -27,6 +27,24 @@ class TestRedactSecret:
         assert dbapi._redact_secret(None) == "<empty>"
 
 
+class TestNumberPlaceholders:
+    @pytest.mark.parametrize(
+        "sql, expected",
+        [
+            ("SELECT ? , ?", "SELECT :p0 , :p1"),
+            ("SELECT * FROM t WHERE a = '?' AND b = ?", "SELECT * FROM t WHERE a = '?' AND b = :p0"),
+            ("SELECT 'it''s ?' , ?", "SELECT 'it''s ?' , :p0"),
+            ('SELECT "col?" FROM t WHERE x = ?', 'SELECT "col?" FROM t WHERE x = :p0'),
+            ("SELECT `a?` , ?", "SELECT `a?` , :p0"),
+            ("SELECT ? -- why?\n, ?", "SELECT :p0 -- why?\n, :p1"),
+            ("SELECT /* ? */ ?", "SELECT /* ? */ :p0"),
+            ("SELECT 1", "SELECT 1"),
+        ],
+    )
+    def test_only_bare_question_marks_are_numbered(self, sql, expected):
+        assert dbapi._number_placeholders(sql) == expected
+
+
 class TestQuoteIdentifier:
     """Tests for identifier quoting."""
 
