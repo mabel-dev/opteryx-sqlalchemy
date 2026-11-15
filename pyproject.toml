@@ -13,8 +13,8 @@ requires-python = ">=3.9"
 # the package uninstallable there. 1.4.24 is the first release with
 # `_ConnectionFairy.dbapi_connection`, which the dialect relies on.
 dependencies = [
-    "requests>=2.31",
-    "sqlalchemy>=1.4.24",
+    "requests>=2.34.2",
+    "sqlalchemy>=2.1.8",
 ]
 
 [project.optional-dependencies]
